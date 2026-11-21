@@ -1,0 +1,1527 @@
+--- before/app_config.py
++++ after/app_config.py
+@@ -61,6 +61,22 @@
+     """Feature extraction and event-triggered capture parameters."""
+ 
+     history_frames: int = 12
++    angle_method: str = "geometry"
++    range_preprocessing: str = "full"
++    phase_sign: int = 1
++    mount_roll_deg: float = 0.0
++    mount_pitch_deg: float = 0.0
++    mount_yaw_deg: float = 0.0
++    calibration_path: str = ""
++    beat_branch: str = "negative"
++    dsp_queue_frames: int = 8
++    mapping_min_range_m: float = .20
++    mapping_max_range_m: float = 1.45
++    mapping_pfa: float = .001
++    mapping_min_snr_db: float = 8.
++    mapping_min_coherence: float = .5
++    mapping_max_angle_peaks: int = 3
++    motion_min_abs_velocity_m_s: float = 0.
+     range_fft_bins: int = 64
+     input_sample_limit: int = 64
+     rti_sample_step: int = 2
+@@ -92,6 +108,16 @@
+     angle_history_stop: int = 12
+ 
+     def __post_init__(self):
++        import math
++        if not all(math.isfinite(v) for v in (self.phase_sign,self.mount_roll_deg,self.mount_pitch_deg,self.mount_yaw_deg,self.mapping_min_range_m,self.mapping_max_range_m,self.mapping_pfa,self.mapping_min_snr_db,self.mapping_min_coherence,self.motion_min_abs_velocity_m_s)):
++            raise ValueError('Finite DSP settings required')
++        if self.phase_sign not in (-1,1) or self.beat_branch not in ('negative','positive') or not 0<self.mapping_pfa<1 or not 0<=self.mapping_min_coherence<=1 or not 0<=self.mapping_min_range_m<self.mapping_max_range_m or self.mapping_max_angle_peaks<1 or self.motion_min_abs_velocity_m_s<0:
++            raise ValueError('Invalid geometry/detection settings')
++        if self.angle_method not in ("geometry", "capon", "music"):
++            raise ValueError("Unknown angle method")
++        if self.range_preprocessing != "full":
++            raise ValueError("Live DSP requires full ADC samples; legacy decimation is retained only in the source backup")
++        if self.dsp_queue_frames<1: raise ValueError("DSP queue must be bounded and positive")
+         if self.history_frames <= 0 or self.range_fft_bins <= 0:
+             raise ValueError("DSP history and FFT sizes must be positive")
+         if self.history_frames < 12:
+@@ -160,6 +186,9 @@
+     serial: SerialPortConfig = field(default_factory=SerialPortConfig)
+     paths: PathConfig = field(default_factory=PathConfig)
+     micro_doppler_only: bool = False
++    physical_profile: object = None
++    profile_cfg_sha256: str = ""
++    profile_cfg_text: str = ""
+     feature_queue_size: int = 2
+     ui_refresh_milliseconds: int = 10
+     capture_interval_milliseconds: int = 2000
+--- before/runtime_state.py
++++ after/runtime_state.py
+@@ -2,6 +2,11 @@
+ 
+ from enum import Enum
+ from threading import Event, Lock
++
++
++class ProcessingMode(Enum):
++    MAPPING = "mapping"
++    MOTION = "motion"
+ 
+ 
+ class FeatureMode(Enum):
+@@ -20,6 +25,15 @@
+         self._capture_ready = Event()
+         self._lock = Lock()
+         self._feature_mode = FeatureMode.FULL
++        self._processing_mode = ProcessingMode.MAPPING
++
++    @property
++    def processing_mode(self):
++        with self._lock: return self._processing_mode
++
++    def set_processing_mode(self,mode):
++        if not isinstance(mode,ProcessingMode): raise TypeError('ProcessingMode required')
++        with self._lock: self._processing_mode=mode
+ 
+     @property
+     def capture_enabled(self):
+--- before/signal_processor.py
++++ after/signal_processor.py
+@@ -17,7 +17,9 @@
+ from app_config import DEFAULT_CONFIG
+ from radar_dsp.doppler_processing import doppler_processing
+ from radar_dsp.utils import Window
+-from runtime_state import RuntimeState
++from runtime_state import RuntimeState, ProcessingMode
++from radar_dsp.mapping import FrameMapper
++from multi_antenna_analysis import Profile
+ 
+ 
+ def doppler_fft(data, window_type_2d=None):
+@@ -63,18 +65,31 @@
+         self._detected_frame_count = 0
+         self._capture_delay_count = 0
+ 
++    def _clutter_enabled(self,explicit):
++        return self.runtime_state.processing_mode is ProcessingMode.MOTION if explicit is None else explicit
++
++    def _get_mapper(self):
++        if not hasattr(self,'mapper'):
++            p=self.config.physical_profile
++            if p is None:
++                p=Profile(self.radar.adc_samples,self.radar.chirps_per_tx,(0,1,2),(0,1,2,3),
++                          2e6,100e12,60e-6,.04,62.3e9)
++            self.mapper=FrameMapper(p,self.settings,self.config.profile_cfg_sha256)
++        return self.mapper
++
+     def process_time_features(
+         self,
+         adc_data,
+         window_type_1d=None,
+-        clutter_removal_enabled=True,
++        clutter_removal_enabled=None,
+         cfar_enabled=False,
+     ):
+-        del cfar_enabled  # Reserved for API compatibility.
++        del cfar_enabled  # Feature API only; mapping detections run in FrameMapper.
++        clutter_removal_enabled=self._clutter_enabled(clutter_removal_enabled)
+         self._validate_adc_frame(adc_data)
+         adc_data = np.transpose(adc_data, (0, 2, 1))
+         sample_end = min(self.settings.input_sample_limit, adc_data.shape[2])
+-        selected = adc_data[:, :, :sample_end:self.settings.rti_sample_step]
++        selected = adc_data
+         radar_cube = range_processing.range_processing(
+             2 * selected,
+             window_type_1d,
+@@ -127,7 +142,7 @@
+         self,
+         adc_data,
+         window_type_1d=Window.HANNING,
+-        clutter_removal_enabled=True,
++        clutter_removal_enabled=None,
+     ):
+         """Build a long Doppler-time strip from one physical RX channel.
+ 
+@@ -138,6 +153,7 @@
+         """
+ 
+         self._validate_adc_frame(adc_data)
++        clutter_removal_enabled=self._clutter_enabled(clutter_removal_enabled)
+         rx_channel = self.settings.micro_doppler_rx_channel
+         # Range processing is independent for every chirp, so frames can be
+         # concatenated afterwards without changing the result.  Unlike the
+@@ -219,15 +235,37 @@
+         self,
+         data,
+         padding_size=None,
+-        clutter_removal_enabled=True,
++        clutter_removal_enabled=None,
+         window_type_1d=Window.HANNING,
+         music_enabled=False,
+     ):
++        if self.settings.angle_method in ('geometry','capon','music'):
++            self._validate_adc_frame(data)
++            mode='motion' if self._clutter_enabled(clutter_removal_enabled) else 'mapping'
++            self.latest_mapping=self._get_mapper().process(data,mode=mode,angle_method='music' if music_enabled else None)
++            result=self.latest_mapping
++            result['diagnostics']['profile_source']='active_cfg' if self.config.physical_profile is not None else 'assumed_default_profile'
++            # Preserve legacy GUI tensor dimensions, while exposing physical
++            # maps and axes without rescaling in latest_mapping.
++            target_angles=np.linspace(-90,90,self.settings.angle_bins)
++            maps=[]
++            for key,axis in [('ra','az'),('re','el')]:
++                source=result[key];display=np.zeros((self.settings.angle_bins,self.settings.range_fft_bins))
++                if source.max()>0:
++                    db=10*np.log10(np.maximum(source,1e-30)/source.max())
++                    brightness=np.clip((db+40)/5,0,8)
++                    for ri in range(len(result['ranges'])):
++                        display[:,ri]=np.interp(target_angles,result[axis],brightness[ri],left=0,right=0)
++                maps.append(display)
++            self.rai_history.append(maps[0]);self.rei_history.append(maps[1])
++            return np.asarray(self.rai_history),np.asarray(self.rei_history)
++        clutter_removal_enabled=self._clutter_enabled(clutter_removal_enabled)
++        music_enabled=music_enabled or self.settings.angle_method=='legacy_music'
+         del padding_size  # Retained for callers of the original API.
+         self._validate_adc_frame(data)
+         adc_data = np.transpose(data, (0, 2, 1))
+         sample_end = min(self.settings.input_sample_limit, adc_data.shape[2])
+-        selected = adc_data[:, :, :sample_end:self.settings.angle_sample_step]
++        selected = adc_data
+         radar_cube = range_processing.range_processing(
+             2 * selected,
+             window_type_1d,
+--- before/data_pipeline.py
++++ after/data_pipeline.py
+@@ -2,17 +2,17 @@
+ 
+ import time
+ from ctypes import POINTER, c_int, c_short, cast, cdll
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from multiprocessing import Process, RawArray
+ from pathlib import Path
+-from queue import Empty, Full
+-from threading import Event, Thread
++from queue import Empty, Full, Queue
++from threading import Event, Thread, Lock
+ 
+ import numpy as np
+ 
+ from app_config import DEFAULT_CONFIG, RadarFrameConfig
+ from radar_dsp.utils import Window
+-from runtime_state import FeatureMode
++from runtime_state import FeatureMode, ProcessingMode
+ 
+ 
+ @dataclass(frozen=True)
+@@ -25,6 +25,9 @@
+     rdi: np.ndarray
+     rai: np.ndarray
+     rei: np.ndarray
++    points: tuple = ()
++    diagnostics: dict = field(default_factory=dict)
++    physical_maps: dict = field(default_factory=dict)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -109,32 +112,122 @@
+         self.radar_config = radar_config
+         self._stop_event = Event()
+         self.raw_recorder = raw_recorder
++        settings=getattr(signal_processor,'settings',None)
++        self.dsp_queue=Queue(maxsize=getattr(settings,'dsp_queue_frames',8))
++        self._stats_lock=Lock()
++        self._stats=dict(observed_frames=0,processed_frames=0,processing_attempts=0,dsp_queue_dropped_frames=0,
++            unstable_copies=0,incomplete_frames=0,processing_errors=0,
++            source_sequence_gaps=0,source_duplicate_frames=0,source_reordered_frames=0,source_sequence_available=False,last_source_sequence=None,processing_total_ms=0.,processing_max_ms=0.,
++            capture_notification='alternating_half_flag',upstream_lost_frames=None,udp_packet_gaps=None,
++            native_overwritten_frames=None,native_incomplete_frames=None)
++        self._dsp_worker=None
++
++    def snapshot_diagnostics(self):
++        with self._stats_lock:
++            result=dict(self._stats)
++        result['processing_mean_ms']=result['processing_total_ms']/max(result['processing_attempts'],1)
++        result['dsp_queue_depth']=self.dsp_queue.qsize()
++        return result
++
++    def _count(self,**values):
++        with self._stats_lock:
++            for key,value in values.items(): self._stats[key]+=value
+ 
+     def stop(self):
+         self._stop_event.set()
+ 
++    def _accept_frame(self,raw_frame,timestamp_ns,source_sequence=None):
++        raw_frame=np.asarray(raw_frame)
++        if raw_frame.dtype!=np.int16 or raw_frame.size!=self.radar_config.raw_values_per_frame:
++            self._count(incomplete_frames=1);return
++        raw_frame=raw_frame.copy()
++        self._count(observed_frames=1)
++        observed=self.snapshot_diagnostics()['observed_frames']
++        if source_sequence is not None:
++            with self._stats_lock:
++                self._stats['source_sequence_available']=True
++                last=self._stats['last_source_sequence']
++                if last is not None and source_sequence==last:self._stats['source_duplicate_frames']+=1
++                if last is not None and source_sequence<last:self._stats['source_reordered_frames']+=1
++                if last is not None and source_sequence>last+1:
++                    self._stats['source_sequence_gaps']+=source_sequence-last-1
++                self._stats['last_source_sequence']=source_sequence
++        # Recording never waits for DSP. Payload is copied/queued by recorder.
++        if self.raw_recorder is not None:
++            self.raw_recorder.submit(raw_frame,observed_sequence=observed,
++                observed_monotonic_ns=timestamp_ns,source_sequence=source_sequence)
++        packet=(observed,timestamp_ns,raw_frame)
++        try: self.dsp_queue.put_nowait(packet)
++        except Full:
++            try: self.dsp_queue.get_nowait();self._count(dsp_queue_dropped_frames=1)
++            except Empty: pass
++            try: self.dsp_queue.put_nowait(packet)
++            except Full: self._count(dsp_queue_dropped_frames=1)
++
++    def _consume_dsp(self):
++        while not self._stop_event.is_set() or not self.dsp_queue.empty():
++            try: sequence,timestamp,raw=self.dsp_queue.get(timeout=.05)
++            except Empty: continue
++            started=time.perf_counter()
++            try:
++                frame=self._process_frame(self._decode_frame(raw),sequence)
++                self._count(processed_frames=1)
++                if frame is not None:
++                    if hasattr(frame,'diagnostics'):
++                        frame.diagnostics.update(observed_monotonic_ns=timestamp,
++                            queue_latency_ms=(time.monotonic_ns()-timestamp)/1e6)
++                    if hasattr(frame,'points'):
++                        for point in frame.points:
++                            point.update(sequence=sequence,timestamp_s=timestamp/1e9,timestamp_source='host_observation_monotonic')
++                    self._publish_latest(frame)
++            except Exception as error:
++                self._count(processing_errors=1)
++                with self._stats_lock:self._stats['last_processing_error']=repr(error)
++            finally:
++                elapsed=(time.perf_counter()-started)*1000
++                self._count(processing_attempts=1,processing_total_ms=elapsed)
++                with self._stats_lock:self._stats['processing_max_ms']=max(self._stats['processing_max_ms'],elapsed)
++
+     def run(self):
+-        sequence = 0
+-        last_active_half = self.capture_buffer.active_half
+-        while not self._stop_event.is_set():
+-            active_half = self.capture_buffer.active_half
+-            if active_half == last_active_half:
+-                time.sleep(0.001)
+-                continue
+-
+-            last_active_half = active_half
+-            raw_frame = self.capture_buffer.copy_latest_frame(active_half)
+-            if self.raw_recorder is not None:
+-                self.raw_recorder.submit(raw_frame)
+-            adc_frame = self._decode_frame(raw_frame)
+-            sequence += 1
+-            feature_frame = self._process_frame(adc_frame, sequence)
+-            if feature_frame is not None:
+-                self._publish_latest(feature_frame)
++        self._dsp_worker=Thread(target=self._consume_dsp,name=self.name+'-DSP',daemon=True)
++        self._dsp_worker.start()
++        try:
++            if hasattr(self.capture_buffer,'get_next_frame'):
++                # Optional sequence-aware transport adapter (e.g. CPSL).
++                # The bundled DLL does NOT expose this interface.
++                with self._stats_lock:self._stats['capture_notification']='sequence_aware_adapter'
++                while not self._stop_event.is_set():
++                    packet=self.capture_buffer.get_next_frame(timeout=.05)
++                    if packet is not None:
++                        raw,source_sequence,timestamp_ns=packet
++                        self._accept_frame(raw,timestamp_ns,source_sequence)
++            else:
++                last_half=self.capture_buffer.active_half
++                while not self._stop_event.is_set():
++                    half=self.capture_buffer.active_half
++                    if half==last_half:
++                        self._stop_event.wait(.0005);continue
++                    raw=self.capture_buffer.copy_latest_frame(half)
++                    # Detect only an observed switch during copy. Two or more
++                    # unobserved transitions cannot be inferred from one bit.
++                    last_half=half
++                    if self.capture_buffer.active_half!=half:
++                        self._count(unstable_copies=1);continue
++                    self._accept_frame(raw,time.monotonic_ns())
++        finally:
++            self._stop_event.set()
++            self._dsp_worker.join()
+ 
+     def _process_frame(self, adc_frame, sequence):
+         """Run only the DSP path selected by the display-mode menu."""
+ 
++        policy=self.signal_processor.runtime_state.processing_mode
++        if getattr(self,'_last_policy',None) is not policy:
++            for name in ('rti_history','rdi_history','rai_history','rei_history'):
++                if hasattr(self.signal_processor,name):getattr(self.signal_processor,name).clear()
++            if hasattr(self.signal_processor,'reset_micro_doppler_history'):self.signal_processor.reset_micro_doppler_history()
++            self._last_policy=policy
++        suppress=policy is ProcessingMode.MOTION
+         mode = self.signal_processor.runtime_state.feature_mode
+         if mode is FeatureMode.MICRO_DOPPLER:
+             micro_doppler = self.signal_processor.process_micro_doppler(
+@@ -142,18 +235,21 @@
+             )
+             if micro_doppler.size == 0:
+                 return None
+-            if self.signal_processor.runtime_state.feature_mode is mode:
++            if self.signal_processor.runtime_state.feature_mode is mode and self.signal_processor.runtime_state.processing_mode is policy:
+                 return MicroDopplerFrame(sequence, micro_doppler)
+             return None
+ 
+         rti, rdi, dti = self.signal_processor.process_time_features(
+-            adc_frame, window_type_1d=Window.HANNING
++            adc_frame, window_type_1d=Window.HANNING,clutter_removal_enabled=suppress
+         )
+         if self.signal_processor.runtime_state.feature_mode is not mode:
+             return None
+-        rai, rei = self.signal_processor.process_angle_features(adc_frame)
+-        if self.signal_processor.runtime_state.feature_mode is mode:
+-            return FeatureFrame(sequence, rti, dti, rdi, rai, rei)
++        rai, rei = self.signal_processor.process_angle_features(adc_frame,clutter_removal_enabled=suppress)
++        if self.signal_processor.runtime_state.feature_mode is mode and self.signal_processor.runtime_state.processing_mode is policy:
++            mapping=getattr(self.signal_processor,'latest_mapping',{})
++            return FeatureFrame(sequence,rti,dti,rdi,rai,rei,
++                tuple(mapping.get('points',[])),dict(mapping.get('diagnostics',{})),
++                {key:mapping[key] for key in ('ranges','fd','rd','ra','re','az','el') if key in mapping})
+         return None
+ 
+     def _decode_frame(self, raw_frame):
+@@ -173,8 +269,10 @@
+         )
+         adc_data = adc_data.transpose((0, 2, 1))
+ 
++        profile=getattr(getattr(self.signal_processor,'config',None),'physical_profile',None)
++        order=profile.tx_order if profile is not None else tuple(range(self.radar_config.tx_antennas))
+         tx_channels = [
+-            adc_data[tx_index::self.radar_config.tx_antennas]
++            adc_data[order.index(tx_index)::self.radar_config.tx_antennas]
+             for tx_index in range(self.radar_config.tx_antennas)
+         ]
+         return np.concatenate(tx_channels, axis=2)
+--- before/raw_recorder.py
++++ after/raw_recorder.py
+@@ -3,6 +3,7 @@
+ 
+ import json
+ import time
++import csv
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from queue import Queue, Empty, Full
+@@ -47,7 +48,7 @@
+         """Check whether the writer thread is still running."""
+         return self.thread is not None and self.thread.is_alive()
+ 
+-    def start(self, radar_config, seconds=10):
++    def start(self, radar_config, seconds=10, metadata_extra=None, diagnostics_provider=None):
+         """Start a new raw ADC recording."""
+ 
+         with self.lock:
+@@ -82,6 +83,9 @@
+             self.stop_event.clear()
+ 
+             # Set recording duration
++            self.start_monotonic_ns=time.monotonic_ns()
++            self.diagnostics_provider=diagnostics_provider
++            self.diagnostics_start=diagnostics_provider() if diagnostics_provider else {}
+             self.deadline = time.monotonic() + seconds
+             self.recording = True
+ 
+@@ -101,6 +105,8 @@
+                 "source": "RadarStream CaptureBuffer",
+             }
+ 
++            self.metadata.update(metadata_extra or {})
++            self.metadata["frame_timestamps_file"]=self.output_path.with_suffix(".frames.csv").name
+             # Start writing data in a separate thread
+             self.thread = Thread(
+                 target=self._writer,
+@@ -112,7 +118,7 @@
+ 
+         return self.output_path
+ 
+-    def submit(self, raw_frame):
++    def submit(self, raw_frame, observed_sequence=None, observed_monotonic_ns=None, source_sequence=None):
+         """Receive one raw ADC frame from data_pipeline.py."""
+ 
+         if not self.recording:
+@@ -144,7 +150,10 @@
+             ).tobytes()
+ 
+             try:
+-                self.queue.put_nowait(payload)
++                timestamp=observed_monotonic_ns if observed_monotonic_ns is not None else time.monotonic_ns()
++                self.queue.put_nowait((payload,dict(observed_sequence=observed_sequence,
++                    source_sequence=source_sequence,observed_monotonic_ns=timestamp,
++                    relative_observation_time_s=(timestamp-self.start_monotonic_ns)/1e9)))
+                 self.frames_queued += 1
+ 
+             except Full:
+@@ -167,7 +176,9 @@
+         """Write incoming ADC frames to a .bin file."""
+ 
+         try:
+-            with self.output_path.open("wb") as output_file:
++            with self.output_path.open("wb") as output_file, self.output_path.with_suffix('.frames.csv').open('w',newline='',encoding='utf-8') as times_file:
++                fields=['written_frame','observed_sequence','source_sequence','observed_monotonic_ns','relative_observation_time_s']
++                times_writer=csv.DictWriter(times_file,fieldnames=fields);times_writer.writeheader()
+ 
+                 while (
+                     not self.stop_event.is_set()
+@@ -175,12 +186,13 @@
+                 ):
+ 
+                     try:
+-                        payload = self.queue.get(timeout=0.1)
++                        payload,frame_info = self.queue.get(timeout=0.1)
+ 
+                     except Empty:
+                         continue
+ 
+                     output_file.write(payload)
++                    times_writer.writerow(dict(written_frame=self.frames_written,**frame_info))
+                     self.frames_written += 1
+ 
+         except Exception as exc:
+@@ -194,6 +206,15 @@
+ 
+             # Save information about the recording
+             result = dict(self.metadata)
++            if self.diagnostics_provider:
++                diagnostics=self.diagnostics_provider()
++                delta={key:diagnostics[key]-self.diagnostics_start.get(key,0) for key in
++                    ('observed_frames','processed_frames','dsp_queue_dropped_frames','unstable_copies','incomplete_frames','processing_errors','source_sequence_gaps','source_duplicate_frames','source_reordered_frames')}
++                result['capture_diagnostics']=dict(final_snapshot=diagnostics,interval_counter_deltas=delta,
++                    note='Observation counters, not hardware frame counts. DSP may still finish queued frames after recording stops.')
++            result['timestamp_definition']='Host observation time, not radar acquisition timestamp'
++            result['udp_packet_gaps']=None
++            result['native_overwritten_frames']=None
+ 
+             result.update({
+                 "end_utc": datetime.now(
+--- before/main.py
++++ after/main.py
+@@ -1,6 +1,8 @@
+ """RadarStream application entry point and UI controller."""
+ 
+ import html
++import hashlib
++from dataclasses import replace, asdict
+ import os
+ from pathlib import Path
+ import sys
+@@ -33,7 +35,8 @@
+ )
+ from radar_profile import parse_radar_profile_shape
+ from radar_configurator.widget import RadarConfigPanel
+-from runtime_state import FeatureMode, RuntimeState
++from runtime_state import FeatureMode, RuntimeState, ProcessingMode
++from multi_antenna_analysis import load_profile
+ from signal_processor import RadarSignalProcessor
+ from main_window_ui import Ui_MainWindow
+ 
+@@ -201,11 +204,17 @@
+             # central widget makes two layout systems fight over its geometry,
+             # shrinking it to a strip in the top-left corner. Replace the
+             # central item once with a standalone ViewBox instead.
+-            view = pg.ViewBox(enableMenu=False)
+-            view.setDefaultPadding(0.0)
++            view = pg.PlotItem(enableMenu=False)
++            view.getViewBox().setDefaultPadding(0.0)
+             view.setAspectLocked(False)
+             view.setMouseEnabled(x=False, y=False)
+             widget.setCentralItem(view)
++            labels={'rai':('Sensor azimuth (degrees)','Range (m)'),
++                    'rei':('Sensor elevation (degrees)','Range (m)'),
++                    'rdi':('Range (m)','Radial velocity (m/s; sign unvalidated)'),
++                    'rti':('History index','Fast-time FFT bin (feature view)'),
++                    'dti':('History index','Doppler bin')}
++            view.setLabel('bottom',labels[feature_name][0]);view.setLabel('left',labels[feature_name][1])
+             image = pg.ImageItem(border=None)
+             image.setLookupTable(lookup_table)
+             view.addItem(image)
+@@ -249,6 +258,15 @@
+         self.ui.rawRecordButton.clicked.connect(self.start_raw_recording)
+         self.radar_config_panel.sendRequested.connect(self.send_radar_config)
+         self.radar_config_panel.exitRequested.connect(self.qt_app.exit)
++        self.processing_menu=self.ui.menuBar.addMenu('DSP Processing')
++        self.processing_group=QtWidgets.QActionGroup(self.main_window);self.processing_group.setExclusive(True)
++        for text,mode in [('Mapping — retain stationary objects',ProcessingMode.MAPPING),('Motion — suppress stationary clutter',ProcessingMode.MOTION)]:
++            action=QtWidgets.QAction(text,self.main_window,checkable=True)
++            action.setChecked(mode is self.runtime_state.processing_mode)
++            self.processing_group.addAction(action);self.processing_menu.addAction(action)
++            action.triggered.connect(lambda checked,m=mode: checked and self._set_processing_mode(m))
++        self.processing_status=QtWidgets.QLabel('DSP: mapping | full ADC | nominal ISK geometry')
++        self.main_window.statusBar().addPermanentWidget(self.processing_status)
+         self.ui.fullFeatureAction.triggered.connect(
+             lambda checked: checked and self._set_display_mode(FeatureMode.FULL)
+         )
+@@ -257,9 +275,25 @@
+             and self._set_display_mode(FeatureMode.MICRO_DOPPLER)
+         )
+ 
++    def _set_processing_mode(self,mode):
++        if self.raw_recorder.recording or self.raw_recorder.busy:
++            # Keep one mode per capture metadata interval.
++            for action in self.processing_group.actions():
++                action.setChecked(action.text().startswith('Mapping')==(self.runtime_state.processing_mode is ProcessingMode.MAPPING))
++            self.print_log('Stop recording before changing DSP processing mode.','red');return
++        self.runtime_state.set_processing_mode(mode)
++        self.processing_status.setText('DSP: '+mode.value+' | full ADC | nominal ISK geometry')
++        # The DSP worker clears histories at its next frame boundary.
++        self.latest_features=None
++
+     def _set_display_mode(self, mode):
+         """Select one DSP/display path from the mutually exclusive menu."""
+ 
++        if (self.raw_recorder.recording or self.raw_recorder.busy) and mode is not self.runtime_state.feature_mode:
++            self.print_log('Stop recording before changing display/DSP paths.','red')
++            self.ui.fullFeatureAction.setChecked(self.runtime_state.feature_mode is FeatureMode.FULL)
++            self.ui.microDopplerAction.setChecked(self.runtime_state.feature_mode is FeatureMode.MICRO_DOPPLER)
++            return
+         if mode is FeatureMode.FULL and self.config.micro_doppler_only:
+             self.ui.microDopplerAction.setChecked(True)
+             mode = FeatureMode.MICRO_DOPPLER
+@@ -320,6 +354,9 @@
+         if self.latest_features is None:
+             return
+ 
++        if self.processor is not None and hasattr(self,'processing_status'):
++            stats=self.processor.snapshot_diagnostics()
++            self.processing_status.setText(f'DSP: {self.runtime_state.processing_mode.value} | full ADC | observed {stats["observed_frames"]}, processed {stats["processed_frames"]}, DSP queue skips {stats["dsp_queue_dropped_frames"]}, errors {stats["processing_errors"]} | mean {stats["processing_mean_ms"]:.1f} ms')
+         features = self.latest_features
+         if self.runtime_state.feature_mode is FeatureMode.MICRO_DOPPLER:
+             if not isinstance(features, MicroDopplerFrame):
+@@ -354,6 +391,19 @@
+             levels=self.config.angle_levels,
+         )
+ 
++        maps=getattr(features,'physical_maps',{})
++        if maps:
++            p=self.signal_processor._get_mapper().profile
++            for name,x,y,power in [('rai',maps['az'],maps['ranges'],maps['ra']),
++                                   ('rei',maps['el'],maps['ranges'],maps['re']),
++                                   ('rdi',maps['ranges'],maps['fd']*p.wavelength_m/2,maps['rd'].T)]:
++                reference=max(float(power.max()),1e-30)
++                values=10*np.log10(np.maximum(power,1e-30)/reference)
++                # Images are column-major: X then Y.
++                values=values.T if name in ('rai','rei') else values
++                self.images[name].setImage(values,levels=(-40,0))
++                dx=float(x[1]-x[0]);dy=float(y[1]-y[0])
++                self.images[name].setRect(QtCore.QRectF(float(x[0]-dx/2),float(y[0]-dy/2),len(x)*dx,len(y)*dy))
+         if (
+             self.runtime_state.consume_capture()
+             and self.ui.captureButton.isChecked()
+@@ -401,6 +451,15 @@
+             output_path = self.raw_recorder.start(
+                 radar_config=self.config.radar,
+                 seconds=10,
++                metadata_extra=dict(dsp_processing_mode=self.runtime_state.processing_mode.value,
++                    display_mode=self.runtime_state.feature_mode.value,
++                    range_preprocessing=self.config.dsp.range_preprocessing,dsp_settings=asdict(self.config.dsp),
++                    effective_sample_rate_hz=(self.config.physical_profile.fs_hz if self.config.physical_profile else None),
++                    active_cfg_text=self.config.profile_cfg_text,active_cfg_sha256=self.config.profile_cfg_sha256,
++                    coordinate_frame='X right/Y forward/Z up; ROS X forward/Y left/Z up',
++                    mount_roll_deg=self.config.dsp.mount_roll_deg,phase_sign=self.config.dsp.phase_sign,
++                    calibration_path=self.config.dsp.calibration_path or None),
++                diagnostics_provider=self.processor.snapshot_diagnostics,
+             )
+         except Exception as error:
+             self.print_log(f"Recording error: {error}", "red")
+@@ -554,6 +613,10 @@
+     def _send_radar_config_file(self, config_path, micro_doppler_only=None):
+         try:
+             profile_shape = parse_radar_profile_shape(config_path)
++            cfg_text=Path(config_path).read_text(encoding='utf-8-sig')
++            cfg_sha=hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
++            self._pending_profile_context=(cfg_text,cfg_sha,
++                load_profile(config_path) if profile_shape.tx_antennas==3 and profile_shape.rx_antennas==4 else None)
+             if micro_doppler_only is None:
+                 required_virtual_antennas = max(
+                     self.base_config.dsp.azimuth_channels
+@@ -587,6 +650,9 @@
+             *profile_shape.as_tuple(),
+             micro_doppler_only=micro_doppler_only,
+         )
++        context=getattr(self,'_pending_profile_context',None)
++        if context:
++            runtime_config=replace(runtime_config,profile_cfg_text=context[0],profile_cfg_sha256=context[1],physical_profile=context[2])
+         if runtime_config == self.config:
+             if self.ui is not None and hasattr(self.ui, "fullFeatureAction"):
+                 self._update_display_mode_availability()
+--- before/multi_antenna_analysis.py
++++ after/multi_antenna_analysis.py
+@@ -134,7 +134,11 @@
+ 
+ 
+ def doppler_fft(ranges, suppress_static=False):
+-    data = ranges-ranges.mean(axis=0,keepdims=True) if suppress_static else ranges
++    if suppress_static:
++        centered=ranges-ranges[:1]
++        data=centered-centered.mean(axis=0,keepdims=True)
++    else:
++        data=ranges
+     w = np.hanning(data.shape[0])
+     return np.fft.fftshift(np.fft.fft(data*w[:,None,None],axis=0),axes=0)/w.sum()
+ 
+@@ -171,7 +175,7 @@
+     return float(az[i]),float(el[j]),coherence,im
+ 
+ 
+-def estimate_angles(snapshot, steering, az, el, max_peaks=3, separation_deg=20, relative_db_limit=3):
++def estimate_angles(snapshot, steering, az, el, max_peaks=3, separation_deg=20, relative_db_limit=3, return_audit=False):
+     """Separated local Bartlett maxima; these remain unresolved-target candidates.
+ 
+     Separation avoids filling a main lobe with duplicate points. It does not
+@@ -185,7 +189,8 @@
+         for dc in (-1,0,1):
+             if dr or dc:
+                 local &= image>=padded[1+dr:1+dr+len(el),1+dc:1+dc+len(az)]
+-    candidates=np.argwhere(local & (image>=image.max()*10**(-relative_db_limit/10)))
++    relative=image>=image.max()*10**(-relative_db_limit/10)
++    candidates=np.argwhere(local & relative)
+     candidates=sorted(candidates,key=lambda cell:image[tuple(cell)],reverse=True)
+     peaks=[];directions=[]
+     for j,i in candidates:
+@@ -194,8 +199,10 @@
+         if any(np.rad2deg(np.arccos(np.clip(direction@other,-1,1)))<separation_deg for other in directions): continue
+         peaks.append((float(az[i]),float(el[j]),float(image[j,i]/max(energy/12,1e-30))))
+         directions.append(direction)
+-        if len(peaks)>=max_peaks: break
+-    return peaks
++    audit=dict(angle_local_maxima=int(local.sum()),angle_within_relative_db=len(candidates),
++               angle_after_separation=len(peaks),angle_after_peak_cap=min(len(peaks),max_peaks))
++    peaks=peaks[:max_peaks]
++    return (peaks,audit) if return_audit else peaks
+ 
+ 
+ def xyz_from_angles(r, az_deg, el_deg):
+@@ -203,14 +210,21 @@
+     return (float(r*np.cos(el)*np.sin(az)),float(r*np.cos(el)*np.cos(az)),float(r*np.sin(el)))
+ 
+ 
+-def rotate_mount(xyz, roll_deg=0):
+-    """Right-handed rotation about forward +Y, sensor to mounting frame.
+-
+-    +90 degrees maps sensor +X to mounting -Z, sensor +Z to mounting +X.
+-    Angle of arrival remains in sensor coordinates; this is a rigid XYZ transform.
++def rotate_mount(xyz, roll_deg=0, pitch_deg=0, yaw_deg=0, inverse=False):
++    """Measured sensor-to-mount rotation: Rz(yaw) Rx(pitch) Ry(roll).
++
++    Analysis axes: X right/Y forward/Z up. Roll is about forward Y,
++    pitch about lateral X, yaw about up Z. No angle is inferred from data.
++    inverse=True applies the transpose of this exact rotation.
+     """
+-    x,y,z=xyz;angle=np.deg2rad(roll_deg);c=np.cos(angle);s=np.sin(angle)
+-    return float(c*x+s*z),float(y),float(-s*x+c*z)
++    roll,pitch,yaw=np.deg2rad([roll_deg,pitch_deg,yaw_deg])
++    cr,sr=np.cos(roll),np.sin(roll);cp,sp=np.cos(pitch),np.sin(pitch);cy,sy=np.cos(yaw),np.sin(yaw)
++    ry=np.array([[cr,0,sr],[0,1,0],[-sr,0,cr]])
++    rx=np.array([[1,0,0],[0,cp,-sp],[0,sp,cp]])
++    rz=np.array([[cy,-sy,0],[sy,cy,0],[0,0,1]])
++    rotation=rz@rx@ry
++    result=(rotation.T if inverse else rotation)@np.asarray(xyz)
++    return tuple(float(v) for v in result)
+ 
+ 
+ def compare_angle_models(snapshots,p,min_coherence):
+@@ -231,29 +245,61 @@
+     return reports
+ 
+ 
+-def ca_cfar(power, pfa=1e-3, train=(4,3), guard=(1,1), minimum_snr_db=8):
+-    """2D CA-CFAR on linear power. Circular Doppler, range edges rejected.
+-    pfa is a nominal single-look exponential-noise setting, not a calibrated
+-    false-alarm probability after channel averaging/windowing.
++def _range_shift(values, offset, fill):
++    """Shift range without joining the far and near ends; Doppler alone wraps."""
++    out=np.full_like(values,fill,dtype=float)
++    if offset==0: return values.astype(float,copy=True)
++    if abs(offset)>=values.shape[1]: return out
++    if offset>0: out[:,offset:]=values[:,:-offset]
++    else: out[:,:offset]=values[:,-offset:]
++    return out
++
++
++def ca_cfar(power, pfa=1e-3, train=(4,3), guard=(1,1), minimum_snr_db=8,
++            edge_policy='truncate', return_audit=False):
++    """Local CA-CFAR with counted, truncated range-edge training windows.
++
++    The former policy made the 1.405 m cell ineligible regardless of signal.
++    Truncation retains the configured threshold/SNR and adapts the CFAR scale
++    to the actual training-cell count. This is not calibrated false-alarm PFA.
++    --cfar-edge-policy legacy provides an identical before/after comparison.
+     """
+-    if not 0 < pfa < 1: raise ValueError('PFA must lie between 0 and 1')
++    if not 0<pfa<1 or edge_policy not in ('truncate','legacy'): raise ValueError('Invalid CFAR settings')
++    power=np.asarray(power,float)
++    if power.ndim!=2 or not np.isfinite(power).all() or np.any(power<0):
++        raise ValueError('CFAR requires finite nonnegative 2D linear power')
+     td,tr=train;gd,gr=guard;hd,hr=td+gd,tr+gr
+-    total=np.zeros_like(power,dtype=float);count=0
+-    for d in range(-hd,hd+1):
+-        for r in range(-hr,hr+1):
+-            if abs(d)<=gd and abs(r)<=gr: continue
+-            total+=np.roll(power,(d,r),axis=(0,1));count+=1
+-    noise=total/count
+-    alpha=count*(pfa**(-1/count)-1)
+-    threshold=noise*max(alpha,10**(minimum_snr_db/10))
+-    mask=power>threshold
+-    mask[:,:hr]=False;mask[:,-hr:]=False
+-    local=np.ones_like(mask)
+-    for d in (-1,0,1):
+-        for r in (-1,0,1):
+-            if d or r: local &= power>=np.roll(power,(d,r),axis=(0,1))
+-    mask &= local
+-    return np.argwhere(mask),noise
++    total=np.zeros_like(power);count=np.zeros_like(power)
++    for di in range(-hd,hd+1):
++        for ri in range(-hr,hr+1):
++            if abs(di)<=gd and abs(ri)<=gr: continue
++            row=np.roll(power,di,axis=0)
++            if edge_policy=='legacy':
++                total+=np.roll(row,ri,axis=1);count+=1
++            else:
++                total+=_range_shift(row,ri,0)
++                count+=_range_shift(np.ones_like(power),ri,0)
++    safe=np.maximum(count,1);noise=total/safe
++    alpha=safe*(pfa**(-1/safe)-1)
++    threshold=noise*np.maximum(alpha,10**(minimum_snr_db/10))
++    above=(power>threshold)&(count>0)
++    eligible=above.copy()
++    if edge_policy=='legacy': eligible[:,:hr]=False;eligible[:,-hr:]=False
++    local=np.ones_like(eligible)
++    for di in (-1,0,1):
++        for ri in (-1,0,1):
++            if not (di or ri): continue
++            row=np.roll(power,di,axis=0)
++            neighbor=np.roll(row,ri,axis=1) if edge_policy=='legacy' else _range_shift(row,ri,-np.inf)
++            local &= power>=neighbor
++    selected=eligible&local
++    result=(np.argwhere(selected),noise)
++    if not return_audit: return result
++    audit=dict(cells_total=power.size,threshold_pass_cells=int(above.sum()),
++               edge_policy_pass_cells=int(eligible.sum()),nms_cells=int(selected.sum()),
++               threshold_pass_by_range=above.sum(axis=0),nms_by_range=selected.sum(axis=0),
++               training_cells_by_range=count[0].astype(int))
++    return (*result,audit)
+ 
+ 
+ def load_calibration(path, cfg_hash, phase_sign):
+@@ -315,10 +361,14 @@
+     nonfinite_samples = 0
+     sample_power=np.zeros(ns);sample_peak_counts=np.zeros(ns,dtype=int);boundary_rejections=0
+     frame_counts=[];rejected=[];audit_snapshots=[]
++    cfar_range_audit=[]
+     gate=(abs(ranges)>=args.min_range)&(abs(ranges)<=args.max_range)
+     if not gate.any(): raise ValueError('Requested range interval contains no bins')
+     example=decode_frame(raw[0],p)[0]
++    import time
++    frame_processing_ms=[]
+     for fi,row in enumerate(raw):
++        frame_started=time.perf_counter()
+         if fi and np.array_equal(row,raw[fi-1]): duplicates+=1
+         rails+=int(np.count_nonzero((row==-32768)|(row==32767)));zeros+=int(np.count_nonzero(row==0))
+         z=decode_frame(row,p);rms+=np.mean(abs(z)**2,axis=(0,1))/nf;means+=z.mean(axis=(0,1))/nf
+@@ -344,7 +394,7 @@
+         # Channel phase diagnostic at strongest mean-power range cell (not a target identity).
+         k=int(rt[fi].argmax());snap=d[nl//2,k,:]
+         phase_cross+=snap*np.conj(snap[0]);phase_energy+=abs(snap)**2
+-        counts=dict(frame=fi,time_s=fi*p.frame_s,cfar_cells=0,in_range_cells=0,angle_peaks=0,low_coherence=0,boundary_rejected=0,valid_points=0,cap_rejected=0,exported_points=0,uncertain_exported_points=0)
++        counts=dict(frame=fi,time_s=fi*p.frame_s,cfar_cells=0,in_range_cells=0,angle_peaks=0,low_coherence=0,boundary_rejected=0,valid_points=0,cap_rejected=0,exported_points=0,uncertain_exported_points=0,cells_total=0,threshold_pass_cells=0,edge_policy_pass_cells=0,nms_cells=0,angle_local_maxima=0,angle_within_relative_db=0,angle_after_separation=0,angle_after_peak_cap=0)
+         # Zero Doppler retains stationary reflectors. Average linear power
+         # across frames before conversion to dB, with no detection threshold.
+         static = d[nl // 2] * gains[None, :]
+@@ -354,7 +404,12 @@
+         if args.range_side != 'signed':
+             ra+=joint.max(axis=1)/nf;re+=joint.max(axis=2)/nf
+             detection_power=pc if args.suppress_static else power
+-            candidates,noise=ca_cfar(detection_power,args.pfa,minimum_snr_db=args.min_snr)
++            candidates,noise,cfar_audit=ca_cfar(detection_power,args.pfa,minimum_snr_db=args.min_snr,edge_policy=args.cfar_edge_policy,return_audit=True)
++            for key in ('cells_total','threshold_pass_cells','edge_policy_pass_cells','nms_cells'): counts[key]=cfar_audit[key]
++            for ri in range(len(ranges)):
++                cfar_range_audit.append(dict(frame=fi,range_m=float(ranges[ri]),in_requested_range=bool(gate[ri]),
++                    threshold_pass_cells=int(cfar_audit['threshold_pass_by_range'][ri]),nms_cells=int(cfar_audit['nms_by_range'][ri]),
++                    training_cells=int(cfar_audit['training_cells_by_range'][ri]),legacy_edge_excluded=bool(ri<4 or ri>=len(ranges)-4)))
+             counts['cfar_cells']=len(candidates)
+             candidates=[(int(di),int(ri)) for di,ri in candidates if gate[ri]]
+             counts['in_range_cells']=len(candidates)
+@@ -363,17 +418,18 @@
+             for di,ri in candidates:
+                 snap=tdm_compensate(cube[di,ri,:],fd[di],p)*gains
+                 if args.audit_angle_model: audit_snapshots.append(snap.copy())
+-                peaks=estimate_angles(snap,steer,az,el,args.max_angle_peaks,args.angle_separation,args.angle_peak_db)
++                peaks,angle_audit=estimate_angles(snap,steer,az,el,args.max_angle_peaks,args.angle_separation,args.angle_peak_db,return_audit=True)
++                for key,value in angle_audit.items(): counts[key]+=value
+                 counts['angle_peaks']+=len(peaks)
+                 for peak_rank,(azimuth,elevation,coherence) in enumerate(peaks,1):
+                     ab=bool(np.isclose(abs(azimuth),args.azimuth_limit));eb=bool(np.isclose(abs(elevation),args.elevation_limit))
+                     boundary=ab or eb
+                     distance=float(ranges[ri]);sensor_xyz=xyz_from_angles(distance,azimuth,elevation)
+-                    x,y,zpos=rotate_mount(sensor_xyz,args.mount_roll_deg)
++                    x,y,zpos=rotate_mount(sensor_xyz,args.mount_roll_deg,getattr(args,'mount_pitch_deg',0),getattr(args,'mount_yaw_deg',0))
+                     record=dict(frame=fi,time_s=fi*p.frame_s,range_m=distance,doppler_hz=float(fd[di]),
+                         radial_velocity_m_s=float(velocity[di]),azimuth_deg=azimuth,elevation_deg=elevation,
+                         x_m=x,y_m=y,z_m=zpos,sensor_x_m=sensor_xyz[0],sensor_y_m=sensor_xyz[1],sensor_z_m=sensor_xyz[2],
+-                        mount_roll_deg=args.mount_roll_deg,snr_db=float(10*np.log10(detection_power[di,ri]/max(noise[di,ri],1e-30))),
++                        mount_roll_deg=args.mount_roll_deg,mount_pitch_deg=getattr(args,'mount_pitch_deg',0),mount_yaw_deg=getattr(args,'mount_yaw_deg',0),snr_db=float(10*np.log10(detection_power[di,ri]/max(noise[di,ri],1e-30))),
+                         signal_power_adc2=float(detection_power[di,ri]),
+                         angular_coherence=coherence,angle_at_search_boundary=boundary,azimuth_at_boundary=ab,elevation_at_boundary=eb,
+                         outside_nominal_search=bool(abs(azimuth)>60 or abs(elevation)>20),
+@@ -408,6 +464,8 @@
+             counts['uncertain_exported_points']=sum(row['retained_uncertain'] for row in frame_records)
+             counts['exported_points']=len(frame_records)
+             records.extend(frame_records)
++        counts['processing_ms']=(time.perf_counter()-frame_started)*1000
++        frame_processing_ms.append(counts['processing_ms'])
+         frame_counts.append(counts)
+         if (fi+1)%50==0: print(f'Processed {fi+1}/{nf} frames',flush=True)
+     return dict(ranges=ranges,signed_ranges=signed,fd=fd,velocity=velocity,times=np.arange(nf)*p.frame_s,
+@@ -416,7 +474,7 @@
+                 phase_coherence=abs(phase_cross)/np.sqrt(np.maximum(phase_energy*phase_energy[0],1e-30)),
+                 example=example,az=az,el=el,ra=ra,re=re,intensity=intensity_sum/nf,records=records,duplicate_adjacent_frames=duplicates,
+                 sample_power=sample_power,sample_peak_counts=sample_peak_counts,boundary_rejections=boundary_rejections,frame_counts=frame_counts,rejected=rejected,
+-                angle_model_audit=compare_angle_models(audit_snapshots,p,args.min_coherence) if args.audit_angle_model else [],
++                frame_processing_ms=frame_processing_ms,cfar_range_audit=cfar_range_audit,angle_model_audit=compare_angle_models(audit_snapshots,p,args.min_coherence) if args.audit_angle_model else [],
+                 nonfinite_samples=nonfinite_samples,rail_fraction=rails/raw.size,zero_fraction=zeros/raw.size)
+ 
+ 
+@@ -578,8 +636,26 @@
+         plt.show()
+ 
+ 
++def observation_time_axis(binary,metadata,nframes,period_s):
++    name=metadata.get('frame_timestamps_file')
++    if not name:return np.arange(nframes)*period_s,'nominal_frame_period_unverified',None
++    if Path(name).name!=name:raise ValueError('Timestamp sidecar must be beside the binary')
++    path=Path(binary).parent/name
++    with path.open(newline='',encoding='utf-8') as stream:rows=list(csv.DictReader(stream))
++    if len(rows)!=nframes or [int(row['written_frame']) for row in rows]!=list(range(nframes)):
++        raise ValueError('Timestamp sidecar frame count/order mismatch')
++    times=np.array([float(row['relative_observation_time_s']) for row in rows])
++    if not np.isfinite(times).all() or np.any(np.diff(times)<=0):raise ValueError('Observation timestamps must increase')
++    return times,'host_observation_monotonic_not_radar_time',sha256(path)
++
++
+ def write_results(data,p,args,metadata,calibration_status,cfg_hash,bias):
++    times,time_source,time_hash=observation_time_axis(args.bin,metadata,len(data['times']),p.frame_s)
++    data['times']=times;data['timestamp_source']=time_source
++    for rows in (data['records'],data['rejected'],data['frame_counts']):
++        for row in rows:row['time_s']=float(times[row['frame']])
+     warnings=[
++        'Audited copy: edge CFAR uses actual available training cells; nominal PFA remains approximate.',
+         'RF CFG supplied separately; recording JSON does not bind actual slope/sample-rate to this file.',
+         'Software decoding matches RadarStream and TI nominal layout; native capture implementation and hardware ordering are not independently certified.',
+         'No packet sequence counters or per-frame timestamps. Queue-drop count does not certify loss-free UDP capture.',
+@@ -602,7 +678,7 @@
+                 virtual_channels=[dict(index=4*t+r,tx=t,rx=r,x_m=float(isk_positions()[4*t+r,0]),z_m=float(isk_positions()[4*t+r,1])) for t in range(3) for r in range(4)],
+                 range_bin_spacing_m=p.range_step_m,doppler_bin_hz=1/(p.loops*p.same_tx_s),same_tx_interval_s=p.same_tx_s,
+                 velocity_bin_m_s=p.wavelength_m/(2*p.loops*p.same_tx_s),sampled_bandwidth_hz=p.slope_hz_s*p.samples/p.fs_hz,
+-                range_side=args.range_side,spatial_phase_sign=args.phase_sign,velocity_sign=args.velocity_sign,calibration=calibration_status,
++                timestamp_source=time_source,timestamp_sidecar_sha256=time_hash,range_side=args.range_side,spatial_phase_sign=args.phase_sign,velocity_sign=args.velocity_sign,calibration=calibration_status,
+                 azimuth_limit_deg=args.azimuth_limit,elevation_limit_deg=args.elevation_limit,mount_roll_deg=args.mount_roll_deg,
+                 intensity_definition='Mean per-frame Bartlett power at zero Doppler, indexed by range, elevation, azimuth',
+                 intensity_slice_ranges_m=data['ranges'][intensity_slice_indices(data,args)].tolist(),
+@@ -615,7 +691,8 @@
+                 sample_power=data['sample_power'].tolist(),sample_peak_counts=data['sample_peak_counts'].tolist(),sample_spike_ratio=spike_ratio,pfa=args.pfa,min_snr_db=args.min_snr,min_coherence=args.min_coherence,
+                 detection_range_m=[args.min_range,args.max_range],max_detections_per_frame=args.max_detections,
+                 max_angle_peaks_per_cell=args.max_angle_peaks,angle_separation_deg=args.angle_separation,angle_peak_relative_limit_db=args.angle_peak_db,
+-                selection_totals={key:sum(row[key] for row in data['frame_counts']) for key in ('cfar_cells','in_range_cells','angle_peaks','low_coherence','boundary_rejected','valid_points','cap_rejected','exported_points','uncertain_exported_points')},
++                cfar_edge_policy=args.cfar_edge_policy,processing_mean_ms=float(np.mean(data['frame_processing_ms'])),processing_max_ms=float(np.max(data['frame_processing_ms'])),
++                selection_totals={key:sum(row[key] for row in data['frame_counts']) for key in ('cells_total','threshold_pass_cells','edge_policy_pass_cells','nms_cells','angle_local_maxima','angle_within_relative_db','angle_after_separation','angle_after_peak_cap','cfar_cells','in_range_cells','angle_peaks','low_coherence','boundary_rejected','valid_points','cap_rejected','exported_points','uncertain_exported_points')},
+                 interpolated_sample_indices=getattr(args,'interpolate_samples',[]),nonfinite_samples=data['nonfinite_samples'],
+                 static_suppression=args.suppress_static,adc_mean_removed=not args.keep_adc_dc,validated=False,warnings=warnings,
+                 sources=[GEOMETRY_SOURCE,RAW_SOURCE])
+@@ -623,7 +700,7 @@
+         (args.output/'diagnostics.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+         (args.output/'input_metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
+         (args.output/'input_configuration.cfg').write_text(args.cfg.read_text(encoding='utf-8-sig'),encoding='utf-8')
+-        columns=['frame','time_s','range_m','doppler_hz','radial_velocity_m_s','azimuth_deg','elevation_deg','x_m','y_m','z_m','sensor_x_m','sensor_y_m','sensor_z_m','mount_roll_deg','snr_db','signal_power_adc2','angular_coherence','angle_at_search_boundary','azimuth_at_boundary','elevation_at_boundary','outside_nominal_search','range_bin','doppler_bin','angle_peak_rank','validated','quality_flags','passes_angle_quality','retained_uncertain']
++        columns=['frame','time_s','range_m','doppler_hz','radial_velocity_m_s','azimuth_deg','elevation_deg','x_m','y_m','z_m','sensor_x_m','sensor_y_m','sensor_z_m','mount_roll_deg','mount_pitch_deg','mount_yaw_deg','snr_db','signal_power_adc2','angular_coherence','angle_at_search_boundary','azimuth_at_boundary','elevation_at_boundary','outside_nominal_search','range_bin','doppler_bin','angle_peak_rank','validated','quality_flags','passes_angle_quality','retained_uncertain']
+         with (args.output/'candidate_detections.csv').open('w',newline='',encoding='utf-8') as stream:
+             writer=csv.DictWriter(stream,fieldnames=columns);writer.writeheader();writer.writerows(data['records'])
+         with (args.output/'rejected_angle_candidates.csv').open('w',newline='',encoding='utf-8') as stream:
+@@ -635,6 +712,11 @@
+         np.savez_compressed(args.output/'analysis_arrays.npz',**{key:data[key] for key in ('ranges','signed_ranges','fd','velocity','times','rt','rd','rdc','dt','dtc','signed_original','signed_clean','ra','re','az','el','intensity')})
+         np.savetxt(args.output/'channel_diagnostics.csv',np.c_[np.arange(12),data['channel_rms'],data['channel_mean'].real,data['channel_mean'].imag,data['phase_relative_deg'],data['phase_coherence']],delimiter=',',header='channel,rms_adc,mean_i,mean_q,relative_phase_deg,phase_coherence',comments='')
+         if args.save_decoded: np.save(args.output/'decoded_adc.npy',decode_capture(np.memmap(args.bin,dtype='<i2',mode='r').reshape(-1,p.words),p).astype(np.complex64))
++    if args.output:
++        with (args.output/'cfar_range_audit.csv').open('w',newline='',encoding='utf-8') as stream:
++            columns=['frame','range_m','in_requested_range','threshold_pass_cells','nms_cells','training_cells','legacy_edge_excluded']
++            writer=csv.DictWriter(stream,fieldnames=columns);writer.writeheader();writer.writerows(data['cfar_range_audit'])
++        _write_stage_audit(data,args)
+     print(json.dumps({k:report[k] for k in ('decoded_shape','range_bin_spacing_m','same_tx_interval_s','doppler_bin_hz','velocity_bin_m_s','candidate_detections','boundary_rejections','sample_spike_ratio','calibration','validated')},indent=2),flush=True)
+     print('CSV saved:',(args.output/'candidate_detections.csv').resolve(),flush=True)
+     print('Frame counts:',(args.output/'frame_point_counts.csv').resolve(),flush=True)
+@@ -642,6 +724,28 @@
+     for warning in warnings:
+         if warning.startswith('Concentrated'): print('WARNING:',warning,flush=True)
+     return report
++
++
++def _write_stage_audit(data,args):
++    """Separate range-Doppler cells from angular peaks; a peak can branch."""
++    import matplotlib.pyplot as plt
++    stages=[('Range-Doppler cells','cells_total'),('Above CFAR/SNR','threshold_pass_cells'),
++            ('After edge policy','edge_policy_pass_cells'),('After local RD maxima','nms_cells'),
++            ('Inside requested range','in_range_cells'),('Local angular maxima','angle_local_maxima'),
++            ('Within angular dB window','angle_within_relative_db'),('After angle separation','angle_after_separation'),
++            ('After angular peak cap','angle_after_peak_cap'),('Exported XYZ','exported_points'),
++            ('Uncertain exported XYZ','uncertain_exported_points')]
++    rows=[dict(stage=label,total=sum(row[key] for row in data['frame_counts']),unit='RD cells' if i<5 else 'angle peaks / XYZ') for i,(label,key) in enumerate(stages)]
++    with (args.output/'stage_totals.csv').open('w',newline='',encoding='utf-8') as stream:
++        writer=csv.DictWriter(stream,fieldnames=['stage','total','unit']);writer.writeheader();writer.writerows(rows)
++    fig,axes=plt.subplots(1,2,figsize=(13,5))
++    for ax,subset,title in [(axes[0],rows[:5],'Range-Doppler cells'),(axes[1],rows[5:],'Angular candidates (can branch per cell)')]:
++        labels=[row['stage'] for row in subset];values=[row['total'] for row in subset]
++        ax.barh(labels,values);ax.invert_yaxis();ax.set_title(title)
++        ax.set_xscale('symlog',linthresh=1);ax.set_xlabel('Count, logarithmic scale above 1')
++        for i,v in enumerate(values): ax.text(v,i,f' {v:,}',va='center',fontsize=8)
++    fig.suptitle(args.bin.stem+' | '+args.cfar_edge_policy+' edge policy')
++    fig.tight_layout();fig.savefig(args.output/'processing_stage_counts.png',dpi=160);plt.close(fig)
+ 
+ 
+ def build_parser():
+@@ -655,6 +759,8 @@
+     ap.add_argument('--elevation-limit',type=float,default=20,help='Sensor elevation search half-width; wider than 20 is diagnostic only')
+     ap.add_argument('--mount-roll-deg',type=float,default=0,help='Explicit sensor-to-mount rotation about +Y; +90 maps sensor +X to -Z, +Z to +X')
+     ap.add_argument('--audit-angle-model',action='store_true',help='Compare phase signs and wider searches on identical CFAR snapshots without changing accepted points')
++    ap.add_argument('--mount-pitch-deg',type=float,default=0,help='Measured rotation about analysis X, after roll')
++    ap.add_argument('--mount-yaw-deg',type=float,default=0,help='Measured rotation about analysis Z, after pitch')
+     ap.add_argument('--phase-sign',type=int,choices=[-1,1],default=1,help='Spatial steering sign; validate left/right/up/down')
+     ap.add_argument('--velocity-sign',type=int,choices=[-1,1],default=1,help='Physical radial velocity convention, unvalidated by default')
+     ap.add_argument('--include-boundary',action='store_true',help='With --reject-uncertain, still retain boundary estimates')
+@@ -665,6 +771,7 @@
+     ap.add_argument('--suppress-static',action='store_true',help='Use clutter-suppressed detections; stationary targets disappear')
+     ap.add_argument('--min-range',type=float,default=.20)
+     ap.add_argument('--max-range',type=float,default=1.45)
++    ap.add_argument('--cfar-edge-policy',choices=['truncate','legacy'],default='truncate',help='Count valid edge training cells; legacy reproduces excluded near/far bins')
+     ap.add_argument('--pfa',type=float,default=.001)
+     ap.add_argument('--min-snr',type=float,default=8)
+     ap.add_argument('--min-coherence',type=float,default=.5)
+@@ -689,7 +796,7 @@
+     root = Path(__file__).resolve().parent
+     ap = build_parser()
+     args=ap.parse_args()
+-    if not np.isfinite([args.min_range,args.max_range,args.pfa,args.min_snr,args.min_coherence,args.angle_separation,args.angle_peak_db,args.azimuth_limit,args.elevation_limit,args.mount_roll_deg]).all() or not 0<=args.min_range<args.max_range or not 0<args.pfa<1 or not 0<=args.min_coherence<=1 or args.max_detections<0 or args.max_angle_peaks<1 or not 0<args.angle_separation<=180 or args.angle_peak_db<0:
++    if not np.isfinite([args.min_range,args.max_range,args.pfa,args.min_snr,args.min_coherence,args.angle_separation,args.angle_peak_db,args.azimuth_limit,args.elevation_limit,args.mount_roll_deg,args.mount_pitch_deg,args.mount_yaw_deg]).all() or not 0<=args.min_range<args.max_range or not 0<args.pfa<1 or not 0<=args.min_coherence<=1 or args.max_detections<0 or args.max_angle_peaks<1 or not 0<args.angle_separation<=180 or args.angle_peak_db<0:
+         ap.error('Invalid range, threshold or detection-limit arguments')
+     if not 2<=args.azimuth_limit<=90 or not 2<=args.elevation_limit<=90 or args.azimuth_limit%2 or args.elevation_limit%2:
+         ap.error('Search limits must be even degree values between 2 and 90')
+@@ -727,7 +834,7 @@
+ 
+ if __name__ == '__main__':
+     import sys
+-    batch_flags = {'--manifest', '--empty', '--batch', '--show'}
++    batch_flags = {'--manifest', '--empty', '--batch', '--show', '--associate'}
+     use_batch = any(flag in sys.argv for flag in batch_flags)
+     if '--bin' in sys.argv:
+         position = sys.argv.index('--bin') + 1
+--- before/analyze_radar_3d.py
++++ after/analyze_radar_3d.py
+@@ -71,7 +71,7 @@
+         table.loc[i,'validation_status'] = 'measured_target_within_tolerance' if good else 'measured_target_outside_tolerance'
+         errors = [np.nan]*3
+         if kind=='point':
+-            sensor = np.asarray(core.rotate_mount(truth,-args.mount_roll_deg))
++            sensor = np.asarray(core.rotate_mount(truth,args.mount_roll_deg,getattr(args,'mount_pitch_deg',0),getattr(args,'mount_yaw_deg',0),inverse=True))
+             r = np.linalg.norm(sensor)
+             if r>0:
+                 az = np.degrees(np.arctan2(sensor[0],sensor[1]))
+@@ -137,7 +137,7 @@
+             'duration_for_cadence_check_s':duration,'observed_frames':len(data['times']),
+             'expected_frames_at_configured_cadence':duration/profile.frame_s,
+             'frame_cadence_disagrees':abs(len(data['times'])*profile.frame_s-duration)>max(.2,.1*duration),
+-            'time_s_definition':'frame_index * configured frame period; nominal, missing-frame timing unavailable',
++            'time_s_definition':data.get('timestamp_source','nominal_frame_period_unverified'),
+             'most_common_azimuth_fraction':float(records.azimuth_deg.value_counts(normalize=True).max()) if len(records) else None,
+             'note':'Concentration can indicate a real reflector, sidelobes, packing faults or phase calibration; this test cannot determine the cause.'}
+ 
+@@ -161,7 +161,7 @@
+         fig.colorbar(image,ax=ax,label='Power relative to batch peak (dB)'); finish(fig,name)
+     fig,ax=plt.subplots(figsize=(6,6))
+     if len(t):
+-        sc=ax.scatter(t.x_m,t.y_m,c=t.time_s,s=12,cmap='viridis'); fig.colorbar(sc,ax=ax,label='Nominal time (s)')
++        sc=ax.scatter(t.x_m,t.y_m,c=t.time_s,s=12,cmap='viridis'); fig.colorbar(sc,ax=ax,label='Host observation time (s)' if d.get('timestamp_source','').startswith('host_') else 'Nominal time (s)')
+     else: ax.text(.5,.5,'No accepted XYZ candidates',ha='center',transform=ax.transAxes)
+     target=item['experiment'].get('target',{})
+     if target.get('kind')=='point': ax.scatter(*target['xyz_m'][:2],marker='x',color='red',label='Measured target'); ax.legend()
+@@ -245,6 +245,7 @@
+     parser=core.build_parser()
+     for action in parser._actions:
+         if action.dest in ('bin','json'): action.nargs='+'
++    parser.add_argument('--associate',action='store_true',help='Optional proximity links, not object identity or surface reconstruction')
+     parser.add_argument('--batch',action='store_true')
+     parser.add_argument('--manifest',type=Path)
+     parser.add_argument('--empty',type=Path,help='Optional empty-scene recording; auto-included in batch')
+@@ -256,7 +257,7 @@
+     args=parser.parse_args()
+     if args.range_side=='signed': parser.error('Batch XYZ needs --range-side negative or positive, verified with a known target')
+     if args.calibrate_at is not None: parser.error('Create calibration with the single-recording multi_antenna_analysis.py CLI')
+-    numbers=[args.min_range,args.max_range,args.pfa,args.min_snr,args.min_coherence,args.association_radius,args.gt_tolerance,args.background_db,args.background_min_power_db,args.mount_roll_deg,args.angle_separation,args.angle_peak_db]
++    numbers=[args.min_range,args.max_range,args.pfa,args.min_snr,args.min_coherence,args.association_radius,args.gt_tolerance,args.background_db,args.background_min_power_db,args.mount_roll_deg,args.mount_pitch_deg,args.mount_yaw_deg,args.angle_separation,args.angle_peak_db]
+     if not np.isfinite(numbers).all() or not 0<=args.min_range<args.max_range or not 0<args.pfa<1 or not 0<=args.min_coherence<=1 or min(args.association_radius,args.gt_tolerance,args.background_db)<=0 or args.max_detections<0 or args.max_angle_peaks<1 or not 0<args.angle_separation<=180 or args.angle_peak_db<0:
+         parser.error('Invalid range, detection or comparison settings')
+     if not 1<=args.intensity_slices<=30: parser.error('intensity-slices must be 1..30')
+@@ -287,7 +288,21 @@
+         report=core.write_results(data,p,local,metadata,status,cfg_hash,bias)
+         table=pd.read_csv(local.output/'candidate_detections.csv'); table.insert(0,'recording',binary.stem)
+         table['detection_id']=table.groupby('frame').cumcount(); table['background_status']='uncompared'; table['background_change_db']=np.nan
++        from radar_dsp.mapping import analysis_to_ros, TemporalAssociator
++        ros=analysis_to_ros(table[['x_m','y_m','z_m']].to_numpy().reshape(-1,3))
++        for i,axis in enumerate(('x','y','z')):table['ros_'+axis+'_m']=ros[:,i]
++        table['position_status']=np.where(table.passes_angle_quality,'angle_quality_pass','uncertain_candidate')
++        table['temporally_associated']=False;table['temporal_track_id']=np.nan;table['track_observations']=0
++        if args.associate:
++            tracker=TemporalAssociator()
++            for fi in range(len(data['times'])):
++                selected=table.index[table.frame==fi];rows=table.loc[selected].to_dict('records')
++                tracker.update(rows,float(data['times'][fi]))
++                for index,row in zip(selected,rows):
++                    for key in ('temporally_associated','temporal_track_id','track_observations'):table.loc[index,key]=row[key]
+         matches,validation=validate_targets(table,experiment,local)
++        table.loc[table.validated,'position_status']='ground_truth_compared_within_tolerance'
++        table['timestamp_source']=data['timestamp_source'] 
+         item=dict(name=binary.stem,data=data,table=table,profile=p,out=local.output,experiment=experiment,validation=validation,
+                   quality=quality_report(data,metadata,p),report=report,metadata_path=metadata_path,local=local)
+         matches.to_csv(local.output/'validation_matches.csv',index=False); pd.DataFrame([serial(validation)]).to_csv(local.output/'validation_summary.csv',index=False)
+@@ -301,6 +316,7 @@
+         item['table'].to_csv(item['out']/'candidate_detections.csv',index=False)
+         save_json(item['out']/'metadata_summary.json',dict(report=item['report'],quality=item['quality'],experiment=item['experiment'],validation=item['validation'],background=item.get('background'),
+                   processing=vars(item['local']),metadata_sha256=core.sha256(item['metadata_path']),
++                  temporal_association_enabled=args.associate,temporal_association_definition='One-to-one distance links of angle-quality-passing candidates; repeated observations are not new surfaces',
+                   software_versions=dict(numpy=np.__version__,pandas=pd.__version__),
+                   source_code_sha256={name:core.sha256(Path(__file__).with_name(name)) for name in ('analyze_radar_3d.py','multi_antenna_analysis.py')},
+                   snr_definition='10 log10(range-Doppler mean channel power / local CA-CFAR training-cell mean); not calibrated RF SNR',
+--- before/radar_dsp/compensation.py
++++ after/radar_dsp/compensation.py
+@@ -292,25 +292,13 @@
+ 
+ 
+ def clutter_removal(input_val, axis=0):
+-    """Perform basic static clutter removal by removing the mean from the input_val on the specified doppler axis.
+-
+-    Args:
+-        input_val (ndarray): Array to perform static clutter removal on. Usually applied before performing doppler FFT.
+-            e.g. [num_chirps, num_vx_antennas, num_samples], it is applied along the first axis.
+-        axis (int): Axis to calculate mean of pre-doppler.
+-
+-    Returns:
+-        ndarray: Array with static clutter removed.
+-
+-    """
+-    # Reorder the axes
+-    reordering = np.arange(len(input_val.shape))
+-    reordering[0] = axis
+-    reordering[axis] = 0
+-    input_val = input_val.transpose(reordering)
+-
+-    # Apply static clutter removal
+-    mean = input_val.transpose(reordering).mean(0)
+-    output_val = input_val - mean
+-
+-    return output_val.transpose(reordering)
++    """Stable mean subtraction along the explicitly selected slow-time axis.
++
++    Subtract a reference first so an exactly stationary complex return becomes
++    exactly zero instead of tiny summation residuals later amplified by CFAR.
++    No fast-time ADC samples are deleted or interpolated.
++    """
++    values=np.asarray(input_val)
++    if values.dtype.kind in 'biu':values=values.astype(float)
++    centered=values-np.take(values,[0],axis=axis)
++    return centered-centered.mean(axis=axis,keepdims=True)
+--- before/radar_dsp/mapping.py
++++ after/radar_dsp/mapping.py
+@@ -0,0 +1,178 @@
++"""Hardware-independent frame adapter around the existing audited DSP functions.
++
++Input: complex [same-TX loop, ADC sample, TX-major/RX-minor channel].
++No acquisition, GUI, ROS, interpolation, scene registration or surface fitting.
++"""
++import time
++import numpy as np
++import multi_antenna_analysis as dsp
++
++
++def adapt_virtual_cube(data, axes, channel_pairs):
++    """Explicit adapter for an already-complex 3D transport cube.
++
++    axes names the three dimensions; channel_pairs names every (physical TX,RX)
++    in transport order. These must come from the transport's descriptor, not
++    from an assumption that CPSL uses RadarStream binary packing.
++    """
++    a=np.asarray(data)
++    if a.ndim!=3 or not np.iscomplexobj(a) or len(axes)!=3 or set(axes)!={'loop','sample','channel'}:
++        raise ValueError('Explicit complex loop/sample/channel axes required')
++    desired=[(tx,rx) for tx in range(3) for rx in range(4)]
++    pairs=[tuple(pair) for pair in channel_pairs]
++    if len(pairs)!=12 or set(pairs)!=set(desired):raise ValueError('Complete unique physical channel map required')
++    a=a.transpose([axes.index(name) for name in ('loop','sample','channel')])
++    if a.shape[2]!=12 or not np.isfinite(a).all():raise ValueError('Invalid complex cube')
++    return a[:,:,[pairs.index(pair) for pair in desired]]
++
++
++def adapt_tdm_chirps(data,tx_slot_order,rx_order):
++    """Explicit complex [chirp,RX,sample] -> canonical ISK cube."""
++    a=np.asarray(data)
++    if a.ndim!=3 or not np.iscomplexobj(a) or a.shape[0]%3 or a.shape[1]!=4:
++        raise ValueError('Expected complete complex TDM chirp/RX/sample frame')
++    if sorted(tx_slot_order)!=[0,1,2] or sorted(rx_order)!=[0,1,2,3]:
++        raise ValueError('Physical TX/RX permutations required')
++    a=a[:,[rx_order.index(rx) for rx in range(4)],:].transpose(0,2,1)
++    if not np.isfinite(a).all():raise ValueError('Nonfinite transport cube')
++    return np.concatenate([a[tx_slot_order.index(tx)::3] for tx in range(3)],axis=2)
++
++
++def analysis_to_ros(xyz):
++    """X right/Y forward/Z up -> ROS X forward/Y left/Z up."""
++    a=np.asarray(xyz,float)
++    if a.shape[-1]!=3 or not np.isfinite(a).all(): raise ValueError('Finite XYZ required')
++    return np.stack((a[...,1],-a[...,0],a[...,2]),axis=-1)
++
++
++def ros_to_analysis(xyz):
++    a=np.asarray(xyz,float)
++    if a.shape[-1]!=3 or not np.isfinite(a).all(): raise ValueError('Finite XYZ required')
++    return np.stack((-a[...,1],a[...,0],a[...,2]),axis=-1)
++
++
++class TemporalAssociator:
++    """Optional one-to-one proximity links; no new points or object identity.
++
++    Only angle-quality-passing candidates enter tracks. Hardware/host/nominal
++    timestamp provenance must travel separately with the observations.
++    """
++    def __init__(self,max_distance_m=.15,max_gap_s=.2):
++        if min(max_distance_m,max_gap_s)<=0: raise ValueError('Positive gates required')
++        self.distance=max_distance_m;self.gap=max_gap_s;self.tracks={};self.next_id=0;self.last_time=None
++
++    def update(self,points,timestamp_s):
++        if not np.isfinite(timestamp_s) or (self.last_time is not None and timestamp_s<=self.last_time):
++            raise ValueError('Strictly increasing finite frame timestamps required')
++        self.last_time=timestamp_s
++        self.tracks={k:v for k,v in self.tracks.items() if timestamp_s-v[1]<=self.gap}
++        unused=set(self.tracks);pairs=[]
++        for i,row in enumerate(points):
++            row.update(temporal_track_id=None,temporally_associated=False,track_observations=0)
++            if not row['passes_angle_quality']: continue
++            xyz=np.array([row['x_m'],row['y_m'],row['z_m']])
++            for k in unused:
++                distance=np.linalg.norm(xyz-self.tracks[k][0])
++                if distance<=self.distance:pairs.append((distance,i,k))
++        used_points=set();assignments={}
++        for _,i,k in sorted(pairs):
++            if i not in used_points and k in unused:
++                assignments[i]=k;used_points.add(i);unused.remove(k)
++        for i,row in enumerate(points):
++            if not row['passes_angle_quality']:continue
++            k=assignments.get(i)
++            count=1
++            if k is None:k=self.next_id;self.next_id+=1
++            else:count=self.tracks[k][2]+1
++            xyz=np.array([row['x_m'],row['y_m'],row['z_m']])
++            self.tracks[k]=(xyz,timestamp_s,count)
++            row.update(temporal_track_id=k,temporally_associated=count>1,track_observations=count)
++        return points
++
++
++class FrameMapper:
++    """Reuse range/Doppler, joint geometry, compensation and corrected CFAR."""
++    def __init__(self,profile,settings,cfg_hash=''):
++        self.profile=profile;self.settings=settings
++        self.az,self.el,self.steer=dsp.steering_grid(profile,settings.phase_sign)
++        self.projectors=(self.steer.conj()[:,:,None]*self.steer[:,None,:]).reshape(len(self.steer),144)
++        self.gains,self.bias,self.calibration=dsp.load_calibration(
++            settings.calibration_path or None,cfg_hash,settings.phase_sign)
++
++    def process(self,adc,mode='mapping',timestamp_s=None,sequence=None,angle_method=None):
++        start=time.perf_counter();p=self.profile;s=self.settings
++        adc=np.asarray(adc)
++        if adc.shape!=(p.loops,p.samples,12) or not np.iscomplexobj(adc):
++            raise ValueError('Expected complex [loops,samples,12] canonical ISK cube')
++        if not np.isfinite(adc).all(): raise ValueError('Nonfinite ADC frame')
++        if mode not in ('mapping','motion'): raise ValueError('Unknown DSP processing mode')
++        r=dsp.range_fft(adc);signed=np.fft.fftfreq(p.samples)*p.samples*p.range_step_m
++        indices=np.flatnonzero(signed<0 if s.beat_branch=='negative' else signed>0)
++        indices=indices[np.argsort(abs(signed[indices]))]
++        ranges=abs(signed[indices])-self.bias
++        r=r[:,indices];d=dsp.doppler_fft(r,mode=='motion')
++        fd=np.fft.fftshift(np.fft.fftfreq(p.loops,p.same_tx_s))
++        power=np.mean(abs(d)**2,axis=2)
++        cells,noise,audit=dsp.ca_cfar(power,pfa=s.mapping_pfa,minimum_snr_db=s.mapping_min_snr_db,return_audit=True)
++        gate=(ranges>=s.mapping_min_range_m)&(ranges<=s.mapping_max_range_m)
++        # Compensate every Doppler slot before angular accumulation. This
++        # preserves static and moving power rather than assuming fd==0.
++        offsets=np.array([p.tx_order.index(tx)*p.chirp_s for tx in range(3) for rx in range(4)])
++        corrected=d*np.exp(-2j*np.pi*fd[:,None,None]*offsets[None,None,:])*self.gains
++        # All-Doppler average angular power, equivalent to compensated chirp
++        # covariance Bartlett power. Process range batches to bound memory.
++        method=angle_method or s.angle_method
++        if method not in ('geometry','capon','music'): raise ValueError('Unknown angle spectrum method')
++        covariance=np.einsum('drc,drk->rck',corrected,corrected.conj(),optimize=True)/p.loops
++        if method=='geometry':
++            scores=(covariance.reshape(len(ranges),144)@self.projectors.T).real/12**2
++        else:
++            scores=np.zeros((len(ranges),len(self.steer)))
++            for ri,cov in enumerate(covariance):
++                energy=float(np.trace(cov).real)
++                if energy<=1e-25:continue
++                if method=='capon':
++                    # Actual-position steering; no ULA forward/backward assumption.
++                    inverse=np.linalg.pinv(cov+np.eye(12)*energy/12*1e-3)
++                    denominator=np.sum((self.steer.conj()@inverse)*self.steer,axis=1).real
++                else:
++                    # One-source MUSIC is an explicit model for the display.
++                    _,vectors=np.linalg.eigh(cov);noise_basis=vectors[:,:-1]
++                    denominator=np.sum(abs(self.steer.conj()@noise_basis)**2,axis=1)
++                scores[ri]=1/np.maximum(denominator,1e-30)
++        joint=np.maximum(scores,0).reshape(len(ranges),len(self.el),len(self.az))
++        points=[];in_range=0
++        for di,ri in cells:
++            if not gate[ri]: continue
++            if mode=='motion' and abs(fd[di]*p.wavelength_m/2)<s.motion_min_abs_velocity_m_s: continue
++            in_range+=1
++            peaks=dsp.estimate_angles(corrected[di,ri],self.steer,self.az,self.el,max_peaks=s.mapping_max_angle_peaks)
++            for aa,ee,coherence in peaks:
++                flags=[]
++                if coherence<s.mapping_min_coherence: flags.append('low_coherence')
++                if abs(aa)==60: flags.append('azimuth_boundary')
++                if abs(ee)==20: flags.append('elevation_boundary')
++                xyz=dsp.rotate_mount(dsp.xyz_from_angles(ranges[ri],aa,ee),s.mount_roll_deg,s.mount_pitch_deg,s.mount_yaw_deg)
++                ros=analysis_to_ros(xyz)
++                points.append(dict(sequence=sequence,timestamp_s=timestamp_s,
++                    range_m=float(ranges[ri]),azimuth_deg=aa,elevation_deg=ee,
++                    x_m=xyz[0],y_m=xyz[1],z_m=xyz[2],
++                    ros_x_m=float(ros[0]),ros_y_m=float(ros[1]),ros_z_m=float(ros[2]),
++                    radial_velocity_m_s=float(fd[di]*p.wavelength_m/2),
++                    signal_power_adc2=float(power[di,ri]),
++                    snr_db=float(10*np.log10(max(power[di,ri],1e-30)/max(noise[di,ri],1e-30))),
++                    angular_coherence=coherence,quality_flags=';'.join(flags),
++                    passes_angle_quality=not flags,temporally_associated=False,validated=False,
++                    position_status='angle_quality_pass' if not flags else 'uncertain_candidate'))
++        elapsed=(time.perf_counter()-start)*1000
++        diagnostics=dict(sequence=sequence,timestamp_s=timestamp_s,mode=mode,
++            adc_samples=p.samples,tx=3,rx=4,range_sample_rate_hz=p.fs_hz,
++            rd_cells=int(power.size),above_cfar=int(audit['threshold_pass_cells']),
++            rd_detections=len(cells),in_range_detections=in_range,xyz_candidates=len(points),
++            angle_quality_pass=sum(row['passes_angle_quality'] for row in points),
++            processing_ms=elapsed,heatmap_angle_method=method,detection_angle_method='joint_bartlett_snapshot',calibration=self.calibration,mount_roll_deg=s.mount_roll_deg,mount_pitch_deg=s.mount_pitch_deg,mount_yaw_deg=s.mount_yaw_deg,
++            coordinate_frame='X right/Y forward/Z up; ROS transform explicit',
++            physical_orientation_validated=False)
++        return dict(points=points,diagnostics=diagnostics,ranges=ranges,fd=fd,
++                    range_power=np.mean(abs(r)**2,axis=(0,2)),rd=power,
++                    ra=joint.max(axis=1),re=joint.max(axis=2),az=self.az,el=self.el)
+--- before/tests/test_mapping_fixes.py
++++ after/tests/test_mapping_fixes.py
+@@ -0,0 +1,210 @@
++import unittest
++from dataclasses import replace
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from queue import Queue
++import json
++import time
++import numpy as np
++from app_config import AppConfig, DspConfig, RadarFrameConfig
++from runtime_state import RuntimeState, ProcessingMode
++from signal_processor import RadarSignalProcessor
++from data_pipeline import DataProcessor
++from raw_recorder import RawRecorder
++from radar_dsp.mapping import FrameMapper, TemporalAssociator, analysis_to_ros, ros_to_analysis, adapt_virtual_cube, adapt_tdm_chirps
++import multi_antenna_analysis as dsp
++
++ROOT=Path(__file__).resolve().parents[1]
++
++
++class MappingFixTests(unittest.TestCase):
++    def setUp(self):
++        self.p=dsp.load_profile(ROOT/'radar_configs/iwr6843_generated.cfg')
++        self.settings=DspConfig()
++
++    def target(self,az=20,el=10,range_bin=20,doppler_bin=0):
++        p=self.p
++        x,z=dsp.isk_positions().T
++        aa,ee=np.deg2rad([az,el])
++        steering=np.exp(2j*np.pi/p.wavelength_m*(x*np.sin(aa)*np.cos(ee)+z*np.sin(ee)))
++        fd=doppler_bin/(p.loops*p.same_tx_s)
++        offsets=np.repeat(np.arange(3)*p.chirp_s,4)
++        return 100*steering[None,None,:]*np.exp(-2j*np.pi*range_bin*np.arange(p.samples)[None,:,None]/p.samples)*np.exp(2j*np.pi*fd*(np.arange(p.loops)[:,None,None]*p.same_tx_s+offsets[None,None,:]))
++
++    def test_stationary_and_moving_model_directions(self):
++        mapper=FrameMapper(self.p,self.settings)
++        for az,el,doppler in [(0,0,0),(-20,10,0),(20,-10,5)]:
++            result=mapper.process(self.target(az,el,doppler_bin=doppler))
++            matches=[r for r in result['points'] if abs(r['range_m']-20*self.p.range_step_m)<1e-6 and abs(r['azimuth_deg']-az)<=2 and abs(r['elevation_deg']-el)<=2]
++            self.assertTrue(matches,(az,el,doppler))
++            self.assertFalse(any(r['validated'] for r in result['points']))
++
++    def test_mapping_preserves_static_motion_suppresses_it(self):
++        mapper=FrameMapper(self.p,self.settings);adc=self.target()
++        mapping=mapper.process(adc,'mapping');motion=mapper.process(adc,'motion')
++        self.assertGreater(mapping['rd'].max(),1)
++        self.assertLess(motion['rd'].max(),mapping['rd'].max()*1e-20)
++        self.assertEqual(len(motion['points']),0)
++        moving=mapper.process(self.target(doppler_bin=5),'motion')
++        self.assertGreater(moving['rd'].max(),1)
++
++    def test_stable_clutter_removal_on_each_axis(self):
++        from radar_dsp.compensation import clutter_removal
++        values=np.arange(120).reshape(4,5,6)+1j
++        for axis in (0,1,2,-1):
++            np.testing.assert_allclose(clutter_removal(values,axis),values-values.mean(axis=axis,keepdims=True),atol=1e-12)
++        repeated=np.repeat(np.array([[.1+.3j,.2+.7j]]),64,axis=0)
++        np.testing.assert_equal(clutter_removal(repeated),np.zeros_like(repeated))
++
++    def test_covariance_bartlett_equals_direct_doppler_power(self):
++        mapper=FrameMapper(self.p,self.settings);adc=self.target()
++        result=mapper.process(adc)
++        r=dsp.range_fft(adc);indices=np.arange(63,31,-1)
++        d=dsp.doppler_fft(r[:,indices]);ri=19
++        fd=np.fft.fftshift(np.fft.fftfreq(self.p.loops,self.p.same_tx_s))
++        compensated=np.array([dsp.tdm_compensate(row,frequency,self.p) for row,frequency in zip(d[:,ri],fd)])
++        direct=np.mean(abs(compensated@mapper.steer.conj().T)**2,axis=0)/144
++        self.assertTrue(np.allclose(result['ra'][ri],direct.reshape(len(mapper.el),len(mapper.az)).max(axis=0)))
++
++    def test_ros_axes_and_mount_rotation(self):
++        points=np.array([[0,1,0],[-1,1,0],[1,1,0],[0,1,1],[0,1,-1]])
++        expected=np.array([[1,0,0],[1,1,0],[1,-1,0],[1,0,1],[1,0,-1]])
++        np.testing.assert_equal(analysis_to_ros(points),expected)
++        np.testing.assert_equal(ros_to_analysis(expected),points)
++        np.testing.assert_allclose(dsp.rotate_mount((1,1,0),90),(0,1,-1),atol=1e-12)
++
++    def test_explicit_transport_adapter_axes_and_channel_order(self):
++        canonical=self.target()
++        pairs=[(tx,rx) for tx in range(3) for rx in range(4)][::-1]
++        transport=canonical[:,:,::-1].transpose(2,0,1)
++        result=adapt_virtual_cube(transport,('channel','loop','sample'),pairs)
++        np.testing.assert_equal(result,canonical)
++        slots=(2,0,1);rx=(3,1,0,2)
++        chirps=np.empty((192,4,64),complex)
++        for slot,tx in enumerate(slots):chirps[slot::3]=canonical[:,:,tx*4:(tx+1)*4][:,:,[*rx]].transpose(0,2,1)
++        np.testing.assert_equal(adapt_tdm_chirps(chirps,slots,rx),canonical)
++        with self.assertRaises(ValueError):adapt_virtual_cube(transport,('channel','loop','sample'),pairs[:-1])
++
++    def test_far_target_remains_eligible_no_range_wrap(self):
++        power=np.ones((64,32));power[32,29]=1e6
++        cells,_=dsp.ca_cfar(power)
++        self.assertTrue(np.any((cells==[32,29]).all(1)))
++        _,first=dsp.ca_cfar(np.ones((64,32)))
++        power=np.ones((64,32));power[32,-1]=1e9
++        _,second=dsp.ca_cfar(power)
++        np.testing.assert_equal(first[:,0],second[:,0])
++
++    def test_full_sample_fft_and_no_legacy_decimation_option(self):
++        signal=RadarSignalProcessor()
++        z=self.target(range_bin=30)
++        rti,_,_=signal.process_time_features(z)
++        # The unflipped channel-0 fast-time cube is stored in RTI history.
++        self.assertEqual(np.argmax(abs(signal.rti_history[-1][0])),34)
++        with self.assertRaises(ValueError):DspConfig(range_preprocessing='legacy_features')
++
++    def test_nonfinite_frame_rejected_without_fabricated_coordinates(self):
++        z=self.target();z[0,0,0]=np.nan
++        with self.assertRaises(ValueError):FrameMapper(self.p,self.settings).process(z)
++
++    def test_modes_and_timestamp_metadata(self):
++        state=RuntimeState();self.assertIs(state.processing_mode,ProcessingMode.MAPPING)
++        state.set_processing_mode(ProcessingMode.MOTION)
++        with TemporaryDirectory() as temp:
++            recorder=RawRecorder(temp)
++            binary=recorder.start(RadarFrameConfig(),seconds=1,metadata_extra={'dsp_processing_mode':'mapping','active_cfg_sha256':'test'})
++            recorder.submit(np.zeros(98304,dtype=np.int16),observed_sequence=7,observed_monotonic_ns=time.monotonic_ns(),source_sequence=45)
++            recorder.stop();recorder.wait(None)
++            meta=json.loads(binary.with_suffix('.json').read_text())
++            self.assertEqual(meta['frames_written'],1)
++            self.assertEqual(meta['dsp_processing_mode'],'mapping')
++            self.assertIsNone(meta['udp_packet_gaps'])
++            self.assertIn(',7,45,',binary.with_suffix('.frames.csv').read_text())
++            times,source,digest=dsp.observation_time_axis(binary,meta,1,.04)
++            self.assertEqual(len(times),1)
++            self.assertEqual(source,'host_observation_monotonic_not_radar_time')
++            self.assertTrue(digest)
++
++    def test_dsp_queue_drop_does_not_drop_recording_submission(self):
++        class Recorder:
++            def __init__(self):self.n=0
++            def submit(self,raw,**kwargs):self.n+=1
++        recorder=Recorder();processor=DataProcessor('test',object(),object(),Queue(),raw_recorder=recorder)
++        for i in range(20):processor._accept_frame(np.zeros(98304,dtype=np.int16),time.monotonic_ns(),i)
++        self.assertEqual(recorder.n,20)
++        self.assertEqual(processor.snapshot_diagnostics()['dsp_queue_dropped_frames'],12)
++        self.assertIsNone(processor.snapshot_diagnostics()['upstream_lost_frames'])
++
++    def test_temporal_links_do_not_duplicate_points_or_validate_identity(self):
++        tracker=TemporalAssociator()
++        row=dict(x_m=0.,y_m=1.,z_m=0.,passes_angle_quality=True,validated=False)
++        first=tracker.update([dict(row)],0.)
++        second=tracker.update([dict(row)],.04)
++        self.assertEqual(len(second),1)
++        self.assertEqual(first[0]['temporal_track_id'],second[0]['temporal_track_id'])
++        self.assertTrue(second[0]['temporally_associated'])
++        self.assertFalse(second[0]['validated'])
++        with self.assertRaises(ValueError):tracker.update([], .04)
++
++    def test_source_sequence_gap_is_distinct_from_unknown_native_loss(self):
++        processor=DataProcessor('test',object(),object(),Queue())
++        for sequence in (1,2,5,5,4):processor._accept_frame(np.zeros(98304,dtype=np.int16),time.monotonic_ns(),sequence)
++        stats=processor.snapshot_diagnostics()
++        self.assertEqual(stats['source_sequence_gaps'],2)
++        self.assertEqual(stats['source_duplicate_frames'],1)
++        self.assertEqual(stats['source_reordered_frames'],1)
++        self.assertIsNone(stats['udp_packet_gaps'])
++
++    def test_tx_slot_permutation_is_canonicalized(self):
++        p=replace(self.p,tx_order=(2,0,1))
++        config=replace(AppConfig(),physical_profile=p)
++        signal=RadarSignalProcessor(config)
++        processor=DataProcessor('test',object(),signal,Queue())
++        raw=np.arange(98304,dtype=np.int16)
++        np.testing.assert_equal(processor._decode_frame(raw),dsp.decode_frame(raw,p))
++
++    def test_measured_mount_transform_has_exact_inverse(self):
++        xyz=(.2,1.1,-.3)
++        mounted=dsp.rotate_mount(xyz,25,-10,40)
++        np.testing.assert_allclose(dsp.rotate_mount(mounted,25,-10,40,inverse=True),xyz,atol=1e-12)
++
++    def test_optional_channel_calibration_restores_synthetic_direction(self):
++        with TemporaryDirectory() as temp:
++            phase=np.linspace(-1,1,12)
++            calibration=Path(temp)/'synthetic_calibration.json'
++            calibration.write_text(json.dumps(dict(geometry='IWR6843ISK',cfg_sha256='unit-test',phase_sign=1,
++                correction_real=np.cos(phase).tolist(),correction_imag=(-np.sin(phase)).tolist(),range_bias_m=0)))
++            settings=replace(self.settings,calibration_path=str(calibration))
++            result=FrameMapper(self.p,settings,'unit-test').process(self.target()*np.exp(1j*phase)[None,None,:])
++            self.assertTrue(any(abs(row['azimuth_deg']-20)<=2 and abs(row['elevation_deg']-10)<=2 and row['passes_angle_quality'] for row in result['points']))
++
++    def test_geometry_aware_capon_and_music_display_models(self):
++        for method in ('capon','music'):
++            mapper=FrameMapper(self.p,replace(self.settings,angle_method=method))
++            result=mapper.process(self.target())
++            ri=19
++            self.assertLessEqual(abs(result['az'][result['ra'][ri].argmax()]-20),4)
++            self.assertLessEqual(abs(result['el'][result['re'][ri].argmax()]-10),4)
++            self.assertEqual(result['diagnostics']['heatmap_angle_method'],method)
++
++    def test_gui_mode_and_active_profile_context_without_hardware(self):
++        import os
++        os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
++        import main
++        from unittest.mock import patch
++        with patch.object(main.list_ports,'comports',return_value=[]):
++            app=main.RadarStreamApplication();app._build_ui()
++        try:
++            app.processing_group.actions()[1].trigger()
++            self.assertIs(app.runtime_state.processing_mode,ProcessingMode.MOTION)
++            self.assertIn('motion',app.processing_status.text())
++            with patch.object(app,'open_radar') as hardware:
++                app._send_radar_config_file(str(ROOT/'radar_configs/iwr6843_generated.cfg'),micro_doppler_only=False)
++            hardware.assert_called_once()
++            self.assertEqual(app.config.profile_cfg_sha256,dsp.sha256(ROOT/'radar_configs/iwr6843_generated.cfg'))
++            self.assertIn('profileCfg',app.config.profile_cfg_text)
++            self.assertEqual(app.config.physical_profile,self.p)
++        finally:
++            app.shutdown();app.main_window.close()
++
++
++if __name__=='__main__':unittest.main()

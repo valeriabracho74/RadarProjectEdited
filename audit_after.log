@@ -1,0 +1,116 @@
+Analyzing radar_20261119_232158_393949.bin
+Processed 50/81 frames
+{
+  "decoded_shape": [
+    81,
+    64,
+    64,
+    12
+  ],
+  "range_bin_spacing_m": 0.0468425715625,
+  "same_tx_interval_s": 0.00017999999999999998,
+  "doppler_bin_hz": 86.80555555555556,
+  "velocity_bin_m_s": 0.20885755110799004,
+  "candidate_detections": 747,
+  "boundary_rejections": 0,
+  "sample_spike_ratio": 125.27040093623607,
+  "calibration": "none",
+  "validated": false
+}
+CSV saved: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232158_393949\candidate_detections.csv
+Frame counts: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232158_393949\frame_point_counts.csv
+RF profile, beat/spatial signs and XYZ require physical validation.
+WARNING: Concentrated fast-time spike: sample 55, mean power 125.3x sample median. No automatic repair; inspect capture/hardware before trusting XYZ.
+Analyzing radar_20261119_232236_222785.bin
+Processed 50/76 frames
+{
+  "decoded_shape": [
+    76,
+    64,
+    64,
+    12
+  ],
+  "range_bin_spacing_m": 0.0468425715625,
+  "same_tx_interval_s": 0.00017999999999999998,
+  "doppler_bin_hz": 86.80555555555556,
+  "velocity_bin_m_s": 0.20885755110799004,
+  "candidate_detections": 773,
+  "boundary_rejections": 0,
+  "sample_spike_ratio": 117.95369390415418,
+  "calibration": "none",
+  "validated": false
+}
+CSV saved: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232236_222785\candidate_detections.csv
+Frame counts: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232236_222785\frame_point_counts.csv
+RF profile, beat/spatial signs and XYZ require physical validation.
+WARNING: Concentrated fast-time spike: sample 55, mean power 118.0x sample median. No automatic repair; inspect capture/hardware before trusting XYZ.
+Analyzing radar_20261119_232329_422620.bin
+Processed 50/80 frames
+{
+  "decoded_shape": [
+    80,
+    64,
+    64,
+    12
+  ],
+  "range_bin_spacing_m": 0.0468425715625,
+  "same_tx_interval_s": 0.00017999999999999998,
+  "doppler_bin_hz": 86.80555555555556,
+  "velocity_bin_m_s": 0.20885755110799004,
+  "candidate_detections": 825,
+  "boundary_rejections": 0,
+  "sample_spike_ratio": 100.51066102152711,
+  "calibration": "none",
+  "validated": false
+}
+CSV saved: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232329_422620\candidate_detections.csv
+Frame counts: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232329_422620\frame_point_counts.csv
+RF profile, beat/spatial signs and XYZ require physical validation.
+WARNING: Concentrated fast-time spike: sample 55, mean power 100.5x sample median. No automatic repair; inspect capture/hardware before trusting XYZ.
+Analyzing radar_20261119_232413_874381.bin
+Processed 50/79 frames
+{
+  "decoded_shape": [
+    79,
+    64,
+    64,
+    12
+  ],
+  "range_bin_spacing_m": 0.0468425715625,
+  "same_tx_interval_s": 0.00017999999999999998,
+  "doppler_bin_hz": 86.80555555555556,
+  "velocity_bin_m_s": 0.20885755110799004,
+  "candidate_detections": 485,
+  "boundary_rejections": 0,
+  "sample_spike_ratio": 85.26773538186924,
+  "calibration": "none",
+  "validated": false
+}
+CSV saved: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232413_874381\candidate_detections.csv
+Frame counts: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232413_874381\frame_point_counts.csv
+RF profile, beat/spatial signs and XYZ require physical validation.
+WARNING: Concentrated fast-time spike: sample 55, mean power 85.3x sample median. No automatic repair; inspect capture/hardware before trusting XYZ.
+Analyzing radar_20261119_232622_215674.bin
+Processed 50/79 frames
+{
+  "decoded_shape": [
+    79,
+    64,
+    64,
+    12
+  ],
+  "range_bin_spacing_m": 0.0468425715625,
+  "same_tx_interval_s": 0.00017999999999999998,
+  "doppler_bin_hz": 86.80555555555556,
+  "velocity_bin_m_s": 0.20885755110799004,
+  "candidate_detections": 844,
+  "boundary_rejections": 0,
+  "sample_spike_ratio": 122.24329353504093,
+  "calibration": "none",
+  "validated": false
+}
+CSV saved: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232622_215674\candidate_detections.csv
+Frame counts: C:\Users\valer\OneDrive\Desktop\RadarStream-main\dsp_audit_results\after\run_20261120_165129_667385\radar_20261119_232622_215674\frame_point_counts.csv
+RF profile, beat/spatial signs and XYZ require physical validation.
+WARNING: Concentrated fast-time spike: sample 55, mean power 122.2x sample median. No automatic repair; inspect capture/hardware before trusting XYZ.
+Results saved: dsp_audit_results\after\run_20261120_165129_667385

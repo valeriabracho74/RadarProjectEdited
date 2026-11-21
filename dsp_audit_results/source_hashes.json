@@ -1,0 +1,23 @@
+{
+  "main.py": "345ccedec785b337253cc27c9a9acac44891e8d8030859c2f1b142851cabdbaa",
+  "data_pipeline.py": "730088b96f892449b5a8b0a6d80595c72540004afca5a09c88672c7bd635e2e9",
+  "signal_processor.py": "771f3fbc3bb17e9867e6d1a55c8e3b42dc3219e04f651fcfe743bd0880ce1b88",
+  "app_config.py": "b9bd287ccbd9af8aa0c2990dcdede9231e63e4c9639e9688ef49bf6d9c4e3840",
+  "runtime_state.py": "9986f6503eabd69aab36cd324a6c1be1048b23d5e7f481f2e9a49b47947bcbd5",
+  "raw_recorder.py": "bff8453c36a27e6cd5e55c8dc76e36fb45f98ccf362993a821f70dadca8a8655",
+  "radar_profile.py": "cd52cb9a66df0ec11bd3717b14791277de871be367a5d6034d41de2138ea00c4",
+  "multi_antenna_analysis.py": "73982e7c0a9bc1c6ce21ceadf6b33078c3779ba0d80d9e1e65e03552d75a128c",
+  "analyze_radar_3d.py": "5f4e3b5f7c20272282e994e7282863c0318682e957b961399bfacb78faa3366d",
+  "multi_antenna_analysis_audited.py": "2851091a40033d5634db69013662432238c7180cf852c341e02dcb3680a95728",
+  "analyze_radar_3d_audited.py": "096f0b1007558e1ba4afd1dfc82bca1c7c02e488733850e5213da9ab7782503e",
+  "radar_dsp\\angle_estimation.py": "9d921af681a7ee8faaaac9d3b35fee453e48dacfee6c105e7d3c4ec1d68ac8d9",
+  "radar_dsp\\cfar.py": "a48e8b6fe380fc6bcb3ec49ee23c3ed6e274bf5b4f944c7b6fa0b283e43e1950",
+  "radar_dsp\\compensation.py": "ce35a6ef55e2083c7236e8aae7bd38b929e5d64c667dbfc782287e84039ff0a0",
+  "radar_dsp\\doppler_processing.py": "85f6a82a572851e93abdf142a12a9eadaad7563bcb73976a49d5f6f23b622627",
+  "radar_dsp\\music.py": "2ae89b21f6fb41bb2d5f3b7a4dd3048e37d8fa14568d7bd8b11650b4a3fc1742",
+  "radar_dsp\\noise_removal.py": "488bd62bc731c06a291ea4988d4c109b329e8ad1add0992eddf9a552649cb2a8",
+  "radar_dsp\\range_processing.py": "433e7165b15164592f19e8eca5e7f5de493ec109a003e17ca7ac2467a059f607",
+  "radar_dsp\\utils.py": "637ac032500b54424eed96baea3ac12a9fa59aabdc3f24d61689ceb275a8eea6",
+  "radar_dsp\\zoom_fft.py": "0af8719d581a26304b2be892abfb809be055f1c560cdecffb005a4855cae0b3a",
+  "radar_dsp\\__init__.py": "7c706583c4410ccd763cb5c3e8fdc1d70d804560a5ed8794972f4ae4992b749b"
+}

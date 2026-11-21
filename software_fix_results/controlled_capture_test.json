@@ -1,0 +1,43 @@
+[
+  {
+    "test": "original_synchronous",
+    "source_frames": 250,
+    "source_period_s": 0.04,
+    "dsp_delay_s": 0.08,
+    "written_frames": 86,
+    "writer_queue_drops": 0,
+    "distinct_recorded_source_ids": 86,
+    "actual_missing_source_ids": 164,
+    "hardware_test": false
+  },
+  {
+    "test": "corrected_decoupled",
+    "source_frames": 250,
+    "source_period_s": 0.04,
+    "dsp_delay_s": 0.08,
+    "written_frames": 250,
+    "writer_queue_drops": 0,
+    "distinct_recorded_source_ids": 250,
+    "actual_missing_source_ids": 0,
+    "hardware_test": false,
+    "diagnostics": {
+      "observed_frames": 250,
+      "processed_frames": 114,
+      "processing_attempts": 114,
+      "dsp_queue_dropped_frames": 136,
+      "unstable_copies": 0,
+      "incomplete_frames": 0,
+      "processing_errors": 0,
+      "source_sequence_gaps": 0,
+      "last_source_sequence": null,
+      "processing_total_ms": 10763.792700001432,
+      "processing_max_ms": 96.27369999998336,
+      "capture_notification": "alternating_half_flag",
+      "upstream_lost_frames": null,
+      "udp_packet_gaps": null,
+      "native_overwritten_frames": null,
+      "processing_mean_ms": 94.41923421053887,
+      "dsp_queue_depth": 0
+    }
+  }
+]

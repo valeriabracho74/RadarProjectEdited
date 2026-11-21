@@ -1,0 +1,21 @@
+{
+  "mode": "iq_pairs",
+  "conjugate": false,
+  "packing_verified": false,
+  "frames": 250,
+  "bytes": 16384000,
+  "expected_bytes_for_250_frames": 16384000,
+  "nominal_frame_period_s": 0.04,
+  "chirp_period_s": 0.00031,
+  "range_bin_m": 0.149896229,
+  "doppler_bin_hz": 25.20161290322585,
+  "gate_bins_m": [
+    0.299792458,
+    0.449688687,
+    0.599584916,
+    0.749481145
+  ],
+  "zero_word_fraction": 0.00494140625,
+  "int16_rail_fraction": 0.0,
+  "note": "Rail fraction does not test clipping at lower ADC bit depths. No packet-loss detection. No physical target identification."
+}

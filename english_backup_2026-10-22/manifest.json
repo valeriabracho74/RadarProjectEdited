@@ -1,0 +1,37 @@
+[
+  {
+    "file": "app_config.py",
+    "original_sha256": "d0384421ce2368112e9a099e3a79c253ce8a56711c31ea3482875e75620f08ed",
+    "english_sha256": "b9bd287ccbd9af8aa0c2990dcdede9231e63e4c9639e9688ef49bf6d9c4e3840"
+  },
+  {
+    "file": "hardware_interfaces.py",
+    "original_sha256": "54905d7ef9d9f01617f497930b5a762ce0b7f16e337fa68df9f5543fd941e4d3",
+    "english_sha256": "3a2fc7f0c95bfc3c5dc0bcb14679d1d8ec5d4ec277650f81cc9d2ec0e04e8660"
+  },
+  {
+    "file": "main.py",
+    "original_sha256": "e5674fc5f2169ab5f87f1eb1707d1eb89405178512afe24f68d9d94fe54d5b1f",
+    "english_sha256": "afccd9a29f3d2e43bdf6f609bbd34807e4e91eaebd762ef5cbdfc6cda7c187ba"
+  },
+  {
+    "file": "main_window_ui.py",
+    "original_sha256": "33d83a8341404930d156fdc1d0b7737cddcf4b09dd8a028b5510a1794afbc154",
+    "english_sha256": "864edbc6da057210dcf3357ffa6d5cbfd238d96c571f5c5a18041036d26bb4e1"
+  },
+  {
+    "file": "radar_configurator/engine.py",
+    "original_sha256": "46a949baeb865358cb1b374f2d332be52d16131fb05634ff722219dad6ddc44f",
+    "english_sha256": "1c33c3ea7376a1d33a19f9d0eb13d2a60f057c1b86173c110fd2fcc10668239b"
+  },
+  {
+    "file": "radar_configurator/widget.py",
+    "original_sha256": "91973d0db83a979a795e45b314b23f05b49dd976fcecba5cb1ac224dff0e369b",
+    "english_sha256": "a546ee399ded67e28433e22b9c3a68944ba2df2d0519e484fdd5bcc35bf51708"
+  },
+  {
+    "file": "tests/test_refactor.py",
+    "original_sha256": "64dbcf31df85bcca9c85fc34468c6719213ed95001d2f1bbbfa598f8a72f2d8a",
+    "english_sha256": "d3440f395b69c9d9d4a0ba519796df64e7187648f568a30ca3bee96071610530"
+  }
+]

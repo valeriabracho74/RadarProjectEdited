@@ -1,0 +1,19 @@
+{
+  "start_utc": "2026-11-11T19:21:52.492353+00:00",
+  "requested_duration_seconds": 10,
+  "adc_samples": 64,
+  "chirps_per_frame": 192,
+  "tx_antennas": 3,
+  "rx_antennas": 4,
+  "int16_values_per_frame": 98304,
+  "bytes_per_frame": 196608,
+  "dtype": "<i2",
+  "source": "RadarStream CaptureBuffer",
+  "end_utc": "2026-11-11T19:22:02.556098+00:00",
+  "frames_queued": 79,
+  "frames_written": 79,
+  "queue_dropped_frames": 0,
+  "invalid_frames": 0,
+  "file_bytes": 15532032,
+  "error": null
+}

@@ -1,0 +1,37 @@
+{
+  "notes": "User supplied ordering and closer movement only. No measured distances, XYZ, mounting roll or same-pose confirmation supplied.",
+  "recordings": {
+    "radar_20261119_232158_393949": {
+      "label": "Bin without object on top",
+      "scene": "bin_only",
+      "baseline": "radar_20261119_232622_215674"
+    },
+    "radar_20261119_232236_222785": {
+      "label": "Bin with object on top",
+      "scene": "bin_with_top_object",
+      "baseline": "radar_20261119_232158_393949"
+    },
+    "radar_20261119_232329_422620": {
+      "label": "Bin with object on top - closer",
+      "scene": "bin_with_top_object",
+      "baseline": "radar_20261119_232622_215674",
+      "expected_relation": {
+        "previous": "radar_20261119_232236_222785",
+        "range": "decrease"
+      }
+    },
+    "radar_20261119_232413_874381": {
+      "label": "Bin with object on top - closer again",
+      "scene": "bin_with_top_object",
+      "baseline": "radar_20261119_232622_215674",
+      "expected_relation": {
+        "previous": "radar_20261119_232329_422620",
+        "range": "decrease"
+      }
+    },
+    "radar_20261119_232622_215674": {
+      "label": "Empty scene",
+      "scene": "empty"
+    }
+  }
+}

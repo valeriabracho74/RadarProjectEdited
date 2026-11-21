@@ -1,0 +1,3 @@
+recording,previous,axis,expected,change_m,outcome,interpretation
+radar_20261119_232329_422620,radar_20261119_232236_222785,range,decrease,-0.3278980009375001,incomparable_baselines,Unassociated scene-level peak/median proxy; not target tracking or measured accuracy
+radar_20261119_232413_874381,radar_20261119_232329_422620,range,decrease,-0.18737028624999996,consistent,Unassociated scene-level peak/median proxy; not target tracking or measured accuracy

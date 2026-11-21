@@ -1,0 +1,12 @@
+recording,frames,samples,tx,rx,spike_sample,spike_power_to_median,peak_chirp_fraction,raw_before_fft,decoding_assumption
+radar_20261111_141942_561636,78,64,3,4,35,75.3240077795198,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261111_142009_515256,67,64,3,4,35,90.26264245071769,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261111_142040_762030,79,64,3,4,35,91.1837235411587,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261111_142152_491024,79,64,3,4,35,68.47789376065802,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261111_142235_215843,82,64,3,4,35,86.11090230841808,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261111_142305_048758,79,64,3,4,35,75.12115096353422,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261119_232158_393949,81,64,3,4,55,125.27040093623607,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261119_232236_222785,76,64,3,4,55,117.95369390415415,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261119_232329_422620,80,64,3,4,55,100.5106610215271,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261119_232413_874381,79,64,3,4,55,85.26773538186929,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified
+radar_20261119_232622_215674,79,64,3,4,55,122.24329353504086,1.0,True,project I0 I1 Q0 Q1; not independently hardware-certified

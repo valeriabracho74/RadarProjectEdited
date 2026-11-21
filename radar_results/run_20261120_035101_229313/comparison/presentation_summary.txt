@@ -1,0 +1,10 @@
+RadarStream multi-recording comparison
+XYZ are candidate reflections, not reconstructed object surfaces.
+Bin without object on top: 81 frames; 15 XYZ candidates; 0.19/frame on average (min 0, max 1); no_measured_ground_truth.
+Bin with object on top: 76 frames; 27 XYZ candidates; 0.36/frame on average (min 0, max 1); no_measured_ground_truth.
+Bin with object on top - closer: 80 frames; 84 XYZ candidates; 1.05/frame on average (min 0, max 3); no_measured_ground_truth.
+Bin with object on top - closer again: 79 frames; 152 XYZ candidates; 1.92/frame on average (min 1, max 2); no_measured_ground_truth.
+Empty scene: 79 frames; 18 XYZ candidates; 0.23/frame on average (min 0, max 1); no_measured_ground_truth.
+Empty-scene differences can include occlusion and multipath. Target identity is unconfirmed.
+No distance accuracy can be reported without measured ground truth. time_s uses nominal 40 ms cadence.
+See metadata_summary.json for sample integrity, timing, calibration and configuration provenance.

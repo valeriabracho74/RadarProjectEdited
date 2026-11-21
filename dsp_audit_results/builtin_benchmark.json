@@ -1,0 +1,14 @@
+{
+  "frames_benchmarked": 8,
+  "warm_mean_seconds": {
+    "time_features": 0.0038661285714169935,
+    "angle_features": 0.01331268571430298,
+    "total": 0.017178814285719973
+  },
+  "configured_frame_period_seconds": 0.04,
+  "benchmark_note": "This host/current source only; not a measurement of historical acquisition latency.",
+  "stationary_target_pre_display_power_retained_fraction": 5.355222900024427e-31,
+  "stationary_target_live_default_angle_max": 38.11358372818563,
+  "stationary_target_clutter_disabled_angle_max": 38.11358372818563,
+  "actual_DataProcessor_decoder_parity_frames": 76
+}

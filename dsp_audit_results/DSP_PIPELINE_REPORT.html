@@ -1,0 +1,175 @@
+<!doctype html><html><head><meta charset="utf-8"><title>RadarStream DSP and sparse XYZ investigation</title><style>body{font:16px/1.55 Segoe UI,Arial,sans-serif;color:#172b40;max-width:1200px;margin:35px auto;padding:0 22px}h1{font-size:30px}h2{margin-top:34px;color:#17496c}table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:10px;border:1px solid #ced9e3;text-align:left;vertical-align:top}th{background:#eaf2fa}code{font-size:12px;overflow-wrap:anywhere}img{max-width:100%}.finding{background:#eaf5ee;padding:16px;border-left:5px solid #2a7d48}.note{background:#fff2db;padding:14px}a{color:#1462a3}li{margin:7px 0}</style></head><body>
+<h1>RadarStream DSP and sparse XYZ investigation</h1><p>November 20, 2026 • IWR6843ISK / DCA1000EVM • Current local source plus five November19 evening captures</p>
+<div class="finding"><b>Confirmed software blind spot:</b> the offline detector's fixed edge exclusion made the 1.405m range cell ineligible. The range plot could show that return while the detector never attempted its XYZ. A counted, truncated edge window restores that opportunity without lowering SNR or adding arbitrary noise points.</div>
+<p>The live app and the offline script are different paths. The live app produces feature heatmaps, with stationary-clutter suppression on by default and legacy four-channel angle selections. The offline script already uses the joint physical ISK geometry and produces candidate XYZ. No new radar-processing system was needed.</p>
+<h2>1. Actual processing paths</h2><img src="pipeline.png" alt="Live and offline pipeline diagram">
+<table><thead><tr><th>Stage</th><th>Exact source / function</th><th>Input → output</th><th>Activation / 3TX4RX assessment</th></tr></thead><tbody><tr><td>Raw acquisition</td><td><code>data_pipeline.py:66 — CaptureBuffer.copy_latest_frame</code>; <code>data_pipeline.py:116 — DataProcessor.run</code></td><td>Native double buffer → one copied int16 frame; RawRecorder.submit runs before decoder/DSP.</td><td>Used by capture thread. Native DLL internals and packet loss not observable from the binary.</td></tr><tr><td>ADC decoding</td><td><code>data_pipeline.py:159 — DataProcessor._decode_frame</code>; <code>multi_antenna_analysis.py:111 — decode_frame</code></td><td>[I0,I1,Q0,Q1] → complex chirp/RX/sample blocks → TX-major [64 loops,64 samples,12 channels].</td><td>3 TX / 4 RX shape verified. TX slot order is configured 1,2,4. Physical lane phase and ordering still need hardware validation.</td></tr><tr><td>Live range FFT</td><td><code>signal_processor.py:66 — RadarSignalProcessor.process_time_features</code>; <code>radar_dsp\range_processing.py:38 — range_processing</code></td><td>Time branch takes every second ADC sample (32), doubles amplitude, Hann windows, zero-pads to 64 FFT bins. Angle branch takes every third sample (22), also FFT64.</td><td>Full-feature mode only. These are different effective sample rates and apertures, not equivalent full-band range maps. No anti-alias step precedes slicing.</td></tr><tr><td>Live Doppler FFT</td><td><code>signal_processor.py:66 — RadarSignalProcessor.process_time_features</code>; <code>radar_dsp\doppler_processing.py:69 — doppler_processing</code></td><td>[64,12,64] range cube → [range64,channels12,Doppler64]; interleaved=False because TX is already separated.</td><td>TX separation is not repeated. Slow-time mean removal is enabled by caller defaults, suppressing stationary furniture.</td></tr><tr><td>Live angle maps</td><td><code>signal_processor.py:218 — RadarSignalProcessor.process_angle_features</code>; <code>radar_dsp\angle_estimation.py:222 — aoa_capon</code></td><td>Four selected channels → separate 1D Capon spectra per range bin → normalized range/angle histories. MUSIC exists but defaults off, assumes one source.</td><td>No joint 12-channel ISK position model. Uses ULA steering on non-ULA selected geometry; no called channel calibration or per-detection TDM phase compensation.</td></tr><tr><td>Live detections / XYZ</td><td>No active call from DataProcessor or RadarSignalProcessor to library XYZ / CFAR helpers.</td><td>FeatureFrame contains RTI, DTI, RDI, RAI, REI; main.update_figure displays images. Capture trigger counts threshold crossings; it is not a point list.</td><td>No active 2D/3D point-cloud output. cfar_enabled is explicitly discarded. Library presence does not mean it runs.</td></tr><tr><td>Offline range / Doppler</td><td><code>multi_antenna_analysis.py:130 — range_fft</code>; <code>multi_antenna_analysis.py:136 — doppler_fft</code></td><td>All64 ADC samples and all12 channels; ADC mean removed optionally; normalized Hann64 FFTs. Negative beat branch explicitly selected.</td><td>Stationary clutter retained by default. Separate suppressed plot is diagnostic. Physical range uses supplied CFG, not metadata proof of active RF settings.</td></tr><tr><td>Offline detection / angles</td><td><code>multi_antenna_analysis.py:298 — analyze</code>; <code>multi_antenna_analysis.py:234 — ca_cfar</code>; <code>multi_antenna_analysis.py:174 — estimate_angles</code></td><td>Mean channel RD power → CA-CFAR and 3×3 local maxima → range gate → compensated 12-channel snapshots → joint Bartlett angle peaks.</td><td>Multiple peaks supported. No total cap by default; 3 angular peaks/cell, 3 dB window and 20° separation remain. Low-confidence/boundary angles are kept with flags.</td></tr><tr><td>Offline XYZ / export</td><td><code>multi_antenna_analysis.py:201 — xyz_from_angles</code>; <code>multi_antenna_analysis.py:206 — rotate_mount</code>; <code>analyze_radar_3d.py:145 — plot_recording</code></td><td>r,az,el → X=r cos(el)sin(az), Y=r cos(el)cos(az), Z=r sin(el); optional roll → CSV and cloud.</td><td>No target identity, tracking, surface fitting or pose registration. No ground-truth XYZ supplied; all candidates remain unvalidated.</td></tr></tbody></table>
+<p><b>Historical activation limit:</b> FULL is the RuntimeState default and main can switch to MICRO_DOPPLER, including when a dedicated profile is selected. The recording JSON does not record that mode, UI settings or source revision, so this report traces current executable paths; it cannot prove which heatmaps ran during each historical capture. RawRecorder receives copied ADC before either mode processes it, so live heatmap preprocessing does not modify the saved raw ADC.</p>
+<h2>2. Built-in DSP versus offline analysis</h2><table><thead><tr><th>Stage</th><th>RadarStream live path</th><th>Offline analysis</th><th>Finding</th></tr></thead><tbody><tr><td>ADC decoding</td><td>[I0,I1,Q0,Q1], TX-major separation</td><td>Identical canonical layout</td><td>All 395 frames matched the source decoder; actual DataProcessor method also matched all 76 target frames.</td></tr><tr><td>Range FFT</td><td>32-sample /22-sample strided feature paths, FFT64</td><td>Full64 samples, normalized FFT64, supplied physical axis</td><td>Decimation aliases signals and changes axes; display maps are not the same full-band range measurements.</td></tr><tr><td>Doppler FFT</td><td>Slow-time mean removal defaults on</td><td>Static preserved; same-TX timing from CFG</td><td>Live default suppresses stationary objects; offline default does not.</td></tr><tr><td>Azimuth</td><td>Four-channel ULA Capon, channels 7,4,3,0</td><td>Joint12-channel Bartlett using actual (x,z)</td><td>Live selection is not a horizontal ULA for the assumed ISK ordering.</td></tr><tr><td>Elevation</td><td>Four-channel ULA Capon, channels7,6,11,10; signs +,-,+,-</td><td>Same joint2D physical geometry</td><td>Live elevation elements are not a vertical ULA. Alternating signs lack demonstrated ISK calibration.</td></tr><tr><td>Peak detection</td><td>CFAR helpers exist but not active; trigger is not detection</td><td>CA-CFAR + local RD maxima + separated angle maxima</td><td>Old offline edge policy blocked 1.405m irrespective of strength. Corrected only in audited copies.</td></tr><tr><td>XYZ conversion</td><td>naive_xyz / beamforming_naive_mixed_xyz exist, not called</td><td>Explicit spherical-to-Cartesian conversion</td><td>Dormant helpers assume a different channel arrangement; do not plug in unchanged.</td></tr><tr><td>Point cloud</td><td>No active feature-to-point export</td><td>CSV, XY, XYZ PNG/HTML</td><td>Repeating a reflection across frames does not sample a new surface.</td></tr></tbody></table>
+<h2>3. Antenna mapping assessment</h2><p>The decoded order is TX0/RX0..3, TX1/RX0..3, TX2/RX0..3. In half design-wavelength units, the assumed ISK virtual rows are TX0:(0..3,0), TX1:(2..5,1), TX2:(4..7,0). This agrees with TI's TX/RX geometry description. All12 are not one horizontal ULA. See <a href="virtual_antenna_mapping.csv">the complete mapping</a>.</p>
+<p>For that geometry, the live azimuth selection (7,4,3,0) occupies (5,1),(2,1),(3,0),(0,0): it changes both height and horizontal position. The elevation selection (7,6,11,10) occupies (5,1),(4,1),(7,0),(6,0): it is not a vertical ULA either. <code>gen_steering_vec</code> assumes an ordered half-wavelength 1D ULA, so these selections are mathematically inconsistent with that model. <code>AppConfig</code> checks index bounds and lengths, not physical geometry.</p>
+<p>The offline <code>isk_positions</code> and <code>steering_grid</code> already use the correct nominal two-row model. Its TDM compensation uses each TX slot's chirp time. Channel corrections remain identity without a matching calibration file; mount roll defaults zero; phase and velocity signs are explicit unvalidated conventions. Synthetic direction/TDM tests pass, but software consistency is not independent certification of physical RX labels, native DLL packing, board roll or RF channel phase. The measured 1.40m is radial range only, not measured X/Y/Z.</p>
+<p>A minimal future live-angle correction is to use actual-position steering for all12 channels and preserve static power in a mapping mode, rather than merely swapping four indices. For a horizontal-only diagnostic, channels0..3 and8..11 form the nominal eight-element lower row. Elevation must account for both coordinates jointly; no guessed alternating sign correction is justified. Live acquisition files were left untouched because this request calls for a separately tested analysis correction.</p>
+<h2>4. Exactly where candidates are lost</h2><p>The old CA-CFAR training radius is four range bins. On the selected negative beat branch, there are32 positive-distance cells, from0.04684 to1.49896m. Its code sets the first and last four cells false. The far exclusion starts at1.35843m and includes1.40528m, even though the requested interval is0.20–1.45m. Thus a target at1.40m is inside the requested gate but outside the detector's actual eligible cells. See <a href="range_eligibility.csv">eligibility per range bin</a>.</p>
+<p>The audited copy counts only available range training cells, recomputes the CA-CFAR multiplier for that count, and stops wrapping range neighbors from far to near. Doppler retains circular treatment. The default PFA0.001 and minimum SNR8dB are unchanged; they remain nominal statistics for windowed, channel-averaged power. Edge noise estimates have less support than interior estimates and are not promised to have calibrated false-alarm rates.</p>
+<p>After CFAR, 3×3 range-Doppler local maxima remove neighboring repeats. The physical range gate then applies. Each surviving cell can branch into multiple local Bartlett peaks. A3dB relative window,20° separation and maximum3 angular peaks/cell are explicit selection stages. There is no overall XYZ cap by default. Per your instruction, low-coherence and search-boundary candidates are retained with flags, not discarded or relabeled as accurate. No static suppression was enabled for these outputs.</p>
+<p>The per-frame counters and new stage tables separate RD cells from angular candidates. Those are different units: going from one RD cell to several angular candidates is expected, not newly measured surfaces.</p>
+<p>The live DspConfig values (RTI floor3000, capture threshold3000, minimum14 threshold crossings, two required frames and eight-frame capture delay) affect feature displays or event-triggered feature saving. They do not select offline XYZ and do not alter the raw samples submitted beforehand. The only SNR-like live angle value is a log-summed amplitude scalar minus14.7, followed by display normalization; it is not the offline local CFAR SNR.</p><h2>5. Same-recording before/after</h2><p>All five recordings were rerun with identical settings except <code>--cfar-edge-policy legacy</code> versus <code>truncate</code>. Original binary hashes, original script hashes and before CSV equality were checked. Full range/Doppler/angle power arrays are bit-identical before and after; only detector selection changes.</p>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>label</th>
+      <th>frames</th>
+      <th>xyz_candidates_before</th>
+      <th>xyz_candidates_after</th>
+      <th>angle_quality_pass_before</th>
+      <th>angle_quality_pass_after</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Bin without object on top</td>
+      <td>81</td>
+      <td>633</td>
+      <td>747</td>
+      <td>15</td>
+      <td>15</td>
+    </tr>
+    <tr>
+      <td>Bin with object on top</td>
+      <td>76</td>
+      <td>622</td>
+      <td>773</td>
+      <td>27</td>
+      <td>41</td>
+    </tr>
+    <tr>
+      <td>Bin with object on top - closer</td>
+      <td>80</td>
+      <td>763</td>
+      <td>825</td>
+      <td>84</td>
+      <td>84</td>
+    </tr>
+    <tr>
+      <td>Bin with object on top - closer again</td>
+      <td>79</td>
+      <td>485</td>
+      <td>485</td>
+      <td>152</td>
+      <td>152</td>
+    </tr>
+    <tr>
+      <td>Empty scene</td>
+      <td>79</td>
+      <td>844</td>
+      <td>844</td>
+      <td>18</td>
+      <td>18</td>
+    </tr>
+  </tbody>
+</table>
+<p>For the first object-on-top capture (76frames), 1.40528m candidates changed from <b>0 to 130</b>, spanning <b>68 frames</b>; <b>13</b> pass the existing angle checks. Overall target-recording candidates changed622→773, with27→41 passing angle checks. The remaining732 are flagged uncertain. These are candidate reflections, not130 distinct object surfaces. The approximate1.40m reference is near a native bin but does not imply5mm accuracy.</p>
+<img src="before_after_xy.png" alt="Before and after XY candidates and counts"><img src="known_range_vs_exclusion.png" alt="Known radial distance compared with former detector exclusion">
+<p>Per-stage totals for the 76-frame object capture:</p>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>stage</th>
+      <th>total_before</th>
+      <th>unit</th>
+      <th>total_after</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Range-Doppler cells</td>
+      <td>155648</td>
+      <td>RD cells</td>
+      <td>155648</td>
+    </tr>
+    <tr>
+      <td>Above CFAR/SNR</td>
+      <td>1775</td>
+      <td>RD cells</td>
+      <td>2002</td>
+    </tr>
+    <tr>
+      <td>After edge policy</td>
+      <td>1296</td>
+      <td>RD cells</td>
+      <td>2002</td>
+    </tr>
+    <tr>
+      <td>After local RD maxima</td>
+      <td>318</td>
+      <td>RD cells</td>
+      <td>484</td>
+    </tr>
+    <tr>
+      <td>Inside requested range</td>
+      <td>318</td>
+      <td>RD cells</td>
+      <td>394</td>
+    </tr>
+    <tr>
+      <td>Local angular maxima</td>
+      <td>2485</td>
+      <td>angle peaks / XYZ</td>
+      <td>2987</td>
+    </tr>
+    <tr>
+      <td>Within angular dB window</td>
+      <td>623</td>
+      <td>angle peaks / XYZ</td>
+      <td>788</td>
+    </tr>
+    <tr>
+      <td>After angle separation</td>
+      <td>623</td>
+      <td>angle peaks / XYZ</td>
+      <td>779</td>
+    </tr>
+    <tr>
+      <td>After angular peak cap</td>
+      <td>622</td>
+      <td>angle peaks / XYZ</td>
+      <td>773</td>
+    </tr>
+    <tr>
+      <td>Exported XYZ</td>
+      <td>622</td>
+      <td>angle peaks / XYZ</td>
+      <td>773</td>
+    </tr>
+    <tr>
+      <td>Uncertain exported XYZ</td>
+      <td>595</td>
+      <td>angle peaks / XYZ</td>
+      <td>732</td>
+    </tr>
+  </tbody>
+</table>
+<p><a href="after/run_20261120_165129_667385/radar_20261119_232236_222785/processing_stage_counts.png">Stage-count plot</a> • <a href="after/run_20261120_165129_667385/radar_20261119_232236_222785/cfar_range_audit.csv">Per-frame, per-range CFAR audit</a> • <a href="before_after_summary.csv">All-recording comparison</a></p>
+<h2>6. Confirmed observations versus unresolved causes</h2><ul>
+<li><b>Confirmed:</b> all395 decoded frames matched RadarStream's source decoder; calling the actual DataProcessor decoder also matched all76 frames of the1.40m test. This proves code agreement, not that the native capture library supplies the intended hardware order.</li>
+<li><b>Confirmed:</b> ADC sample55 has the highest mean power on all12 virtual channels in all five captures, including empty. Channel-specific peak/median power ratios range about33–396. This points to a repeatable fast-time pattern worth investigating; it does not by itself identify bad hardware, a packet header or a decoding fault. See <a href="channel_spike_audit.csv">channel audit</a>. No samples were repaired.</li>
+<li><b>Confirmed:</b> each approximately10-second sidecar contains76–81 frames versus roughly250 predicted by supplied40ms cadence. JSON agrees with each binary and reports zero writer-queue drops, but does not bind the RF profile or provide frame timestamps / UDP counters.</li>
+<li><b>Potential capture loss mechanism:</b> DataProcessor polls one alternating buffer-half bit and performs DSP synchronously. If it misses buffer transitions, frames cannot be recovered from the raw recorder's queue counters. This is a design risk, not proof of historical loss. Native buffer/DLL source is unavailable.</li>
+<li><b>Measured on this host now:</b> eight-frame built-in benchmark, excluding first warm-up frame, averaged 17.2ms for time-plus-angle features, below40ms. This short test does not support claiming slow DSP caused these historical missing frames. See <a href="builtin_benchmark.json">benchmark details</a>.</li>
+<li><b>Confirmed policy mismatch:</b> a synthetic stationary return loses effectively all pre-display power under the live default slow-time mean subtraction (retained fraction 5.4e-31). Heatmap normalization/clipping is a display feature and cannot be used as calibrated power or proof that stationary energy survived.</li>
+<li><b>Unresolved:</b> ADC spike cause, active RF profile provenance, actual mount roll, interchannel phase, physical angle/velocity signs, reflector identity and multipath. Distance agreement alone cannot settle these.</li></ul>
+<h2>7. Minimal implemented correction and use</h2><pre>python -m pip install numpy scipy pandas matplotlib plotly</pre><p>Original <code>multi_antenna_analysis.py</code>, <code>analyze_radar_3d.py</code>, recordings, live acquisition and DSP modules are unchanged. The separate <code>multi_antenna_analysis_audited.py</code> adds the edge-window correction and stage instrumentation; <code>analyze_radar_3d_audited.py</code> is the existing batch wrapper pointed at that copy. It does not replace the DSP design or invent points.</p>
+<pre>python multi_antenna_analysis_audited.py --bin raw_recordings/radar_20261119_232236_222785.bin --cfg radar_configs/iwr6843_generated.cfg --range-side negative --no-show</pre>
+<p>For all five recordings, run <code>run_audited_radar_analysis.ps1</code>. The original strict angle filter remains optional via <code>--reject-uncertain</code>; it is not enabled in the delivered results. <code>--cfar-edge-policy legacy</code> reproduces the old detector. All outputs save separately under <code>dsp_audit_results</code>.</p>
+<p>New audit files: <code>stage_totals.csv</code>, <code>processing_stage_counts.png</code>, <code>cfar_range_audit.csv</code>, and expanded <code>frame_point_counts.csv</code>. Existing range FFT, range/azimuth, range/elevation, XY, XYZ HTML/PNG and per-frame counts are regenerated for each recording. Source hashes identify the versions used.</p>
+<p>Tests passed: legacy detector exactly reproduced; a planted strong1.405m cell is recovered; interior training statistics unchanged; far-range power does not wrap into near-range noise; twenty random angle snapshots give unchanged selected peaks; TDM-compensated synthetic directions recover their injected model angles; all selected candidates export without quality rejection; binary and original script hashes unchanged. These tests verify software behavior, not physical accuracy.</p>
+<h2>8. Reuse with CPSL_TI_Radar / Jetson</h2><p>No new offline processing system is needed. Keep transport separate from DSP. CPSL currently documents raw ADC over DCA1000 and firmware-produced serial TLV point clouds as different streams. Choose which one you need: receiving a firmware cloud is not the same as making this host DSP produce a cloud.</p>
+<p>Reuse <code>load_profile</code>/<code>validate_recording</code> for offline provenance, <code>decode_frame</code> only when its binary layout is confirmed, <code>range_fft</code>, <code>doppler_fft</code>, <code>isk_positions</code>, <code>steering_grid</code>, <code>tdm_compensate</code>, corrected <code>ca_cfar</code>, <code>estimate_angles</code>, <code>xyz_from_angles</code> and calibration helpers. Existing <code>radar_dsp.range_processing.range_processing</code>, <code>utils.windowing</code> and <code>doppler_processing</code> are reusable low-level alternatives if their axes, scaling and already-separated TX convention are explicitly matched. Do not copy the whole live feature preprocessing into a furniture-mapping node.</p>
+<p>Convert CPSL's documented ADC tensor/channel order into the canonical [loop,sample,TX-major/RX-minor] layout at one adapter boundary; preserve hardware timestamps and loss counters where available. Do not decode an already complex ADC cube again. Publish candidate point fields and quality flags, with a documented sensor-to-ROS transform. If the ROS frame uses X forward/Y left/Z up, it differs from this analysis's X right/Y forward/Z up. Jetson throughput and live integration were not tested here.</p>
+<h2>9. Sources and reproducibility</h2><ul>
+<li><a href="https://www.ti.com/lit/SWRA581">TI SWRA581B raw ADC data capture</a> — nominal complex sample organization; configured capture format must still be checked.</li>
+<li><a href="https://dev.ti.com/tirex/explore/content/radar_academy_2_10_00_2/_build_radar_academy_2_10_00_2/source/integration/antenna_design.html">TI Radar Academy antenna geometry</a> and <a href="https://www.ti.com/lit/ug/swru546e/swru546e.pdf">SWRU546E, Figure3-9</a> — ISK virtual array, distinct from ODS.</li>
+<li><a href="https://github.com/davidmhunt/CPSL_TI_Radar/blob/main/README.md">CPSL_TI_Radar primary README</a> — transport / output choices, inspected November20,2026.</li>
+<li><a href="source_function_inventory.csv">Exact function/file/line inventory</a>; <a href="source_hashes.json">reviewed source hashes</a>. Sidecar and configuration copies accompany each run. Current source does not prove historical mode/settings.</li></ul>
+<p><b>What the evidence supports:</b> range response follows scene changes, and one confirmed detector exclusion prevented the known far-range cell from ever becoming XYZ. Correcting that fixes a software omission. Reliable direction and a recognizable surface still require a controlled phase/orientation check and resolution of the repeatable sample pattern; increased point count alone is not an accuracy result.</p></body></html>

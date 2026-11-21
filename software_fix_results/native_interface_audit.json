@@ -1,0 +1,8 @@
+{
+  "dll": "native/UDPCAPTUREADCRAWDATA.dll",
+  "exports": [
+    "captureudp"
+  ],
+  "called_interface": "captureudp(active_half_pointer, samples_pointer, frame_length)",
+  "observation": "Current host binding exposes one alternating half bit, not packet sequence/frame counters. Export names alone do not establish undocumented semantics."
+}

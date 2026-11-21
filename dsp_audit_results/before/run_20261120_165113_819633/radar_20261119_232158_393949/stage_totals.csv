@@ -1,0 +1,12 @@
+stage,total,unit
+Range-Doppler cells,165888,RD cells
+Above CFAR/SNR,2131,RD cells
+After edge policy,1531,RD cells
+After local RD maxima,301,RD cells
+Inside requested range,301,RD cells
+Local angular maxima,2263,angle peaks / XYZ
+Within angular dB window,659,angle peaks / XYZ
+After angle separation,655,angle peaks / XYZ
+After angular peak cap,633,angle peaks / XYZ
+Exported XYZ,633,angle peaks / XYZ
+Uncertain exported XYZ,618,angle peaks / XYZ

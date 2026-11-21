@@ -1,0 +1,6 @@
+recording,label,frames,xyz_candidates_before,uncertain_xyz_candidates_before,xyz_candidates_after,uncertain_xyz_candidates_after,angle_quality_pass_before,angle_quality_pass_after
+radar_20261119_232158_393949,Bin without object on top,81,633,618,747,732,15,15
+radar_20261119_232236_222785,Bin with object on top,76,622,595,773,732,27,41
+radar_20261119_232329_422620,Bin with object on top - closer,80,763,679,825,741,84,84
+radar_20261119_232413_874381,Bin with object on top - closer again,79,485,333,485,333,152,152
+radar_20261119_232622_215674,Empty scene,79,844,826,844,826,18,18
