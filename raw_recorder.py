@@ -48,7 +48,7 @@ class RawRecorder:
         """Check whether the writer thread is still running."""
         return self.thread is not None and self.thread.is_alive()
 
-    def start(self, radar_config, seconds=10, metadata_extra=None, diagnostics_provider=None):
+    def start(self, radar_config, seconds=40, metadata_extra=None, diagnostics_provider=None):
         """Start a new raw ADC recording."""
 
         with self.lock:

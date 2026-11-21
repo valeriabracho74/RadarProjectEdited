@@ -594,7 +594,7 @@ class Ui_MainWindow:
         self.captureButton.setCheckable(True)
         layout.addRow(self.captureButton)
         self.rawRecordButton = QtWidgets.QPushButton(
-    "Record Raw ADC (10 s)", body
+    "Record Raw ADC (40 s)", body
 )
         self.rawRecordButton.setObjectName("rawRecordButton")
         self.rawRecordButton.setEnabled(False)

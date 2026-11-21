@@ -436,7 +436,7 @@ class RadarStreamApplication:
 
 
     def start_raw_recording(self):
-        """Start recording raw radar data for 10 seconds."""
+        """Start recording raw radar data for 40 seconds."""
 
         if self._shutting_down:
             return
@@ -450,7 +450,7 @@ class RadarStreamApplication:
         try:
             output_path = self.raw_recorder.start(
                 radar_config=self.config.radar,
-                seconds=10,
+                seconds=40,
                 metadata_extra=dict(dsp_processing_mode=self.runtime_state.processing_mode.value,
                     display_mode=self.runtime_state.feature_mode.value,
                     range_preprocessing=self.config.dsp.range_preprocessing,dsp_settings=asdict(self.config.dsp),
@@ -472,11 +472,11 @@ class RadarStreamApplication:
             "green",
         )
 
-        self.raw_record_timer.start(10000)
+        self.raw_record_timer.start(40000)
 
 
     def stop_raw_recording(self):
-        """Stop collecting frames after 10 seconds."""
+        """Stop collecting frames after 40 seconds."""
 
         if self._shutting_down:
             return
